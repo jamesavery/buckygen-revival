@@ -30,14 +30,21 @@ module Canonical
     , applyAutToExp
     , computeOtherTriple
     , filterByRule2
+      -- * Bounding lemmas
+    , maxExpansionLength
+    , reductionFiveVertices
     ) where
 
 import Seeds (DualGraph(..))
 import Expansion
 import qualified Data.IntMap.Strict as IM
+import Data.IntSet (IntSet)
+import qualified Data.IntSet as IS
 import Data.List (nub, intersect, foldl')
 import Data.Bits ((.|.), shiftL)
 import qualified Data.Set as Set
+import Data.Sequence (Seq, ViewL(..), viewl, (|>))
+import qualified Data.Sequence as Seq
 
 ---------------------------------------------------------------------
 -- Types
@@ -353,8 +360,6 @@ bfsCanonicalForm g u v dir = BFS code
         DRight -> nextCW g
         DLeft  -> prevCW g
 
-    -- Walk deg(w)-1 neighbors of w starting from the one after ref
-    -- in the walk direction, stopping before reaching ref.
     walkNeighbors w ref =
         take (deg g w - 1) $ iterate (step w) (step w ref)
 
@@ -387,7 +392,6 @@ bfsCanonicalForm g u v dir = BFS code
                 in (vtxColour nbr : restE, nm', rm', nn')
 
 -- | BFS from a single starting edge, returning both code and vertex numbering.
--- The numbering maps each original vertex to its BFS number (1-indexed).
 bfsWithNumbering :: DualGraph -> Vertex -> Vertex -> Dir
                  -> (BFSCode, IM.IntMap Int)
 bfsWithNumbering g u v dir = (BFS code, finalNumMap)
@@ -565,10 +569,14 @@ filterByRule2 g auts exps = go Set.empty exps
 -- Each reduction is a (kind, edge, direction) triple representing
 -- a site where the graph could be reduced to a smaller fullerene.
 allReductions :: DualGraph -> [Reduction]
-allReductions g = l0Reds ++ lReds ++ b00Reds ++ bigBReds
-  where
-    maxLen = 5
+allReductions = allReductionsUpTo 5
 
+-- | Enumerate all reductions of length up to maxLen.
+-- Using a smaller maxLen skips expensive bent reduction enumeration
+-- when shorter reductions are guaranteed to dominate in canonOrd.
+allReductionsUpTo :: Int -> DualGraph -> [Reduction]
+allReductionsUpTo maxLen g = l0Reds ++ lReds ++ b00Reds ++ bigBReds
+  where
     l0Reds =
         [ Red (L 0) (u, v) d
         | u <- degree5 g
@@ -577,17 +585,19 @@ allReductions g = l0Reds ++ lReds ++ b00Reds ++ bigBReds
         , isValidL0Direction g (u, v) d
         ]
 
-    lReds = straightReductions maxLen g
+    lReds = if maxLen >= 2 then straightReductions maxLen g else []
 
     b00Reds =
-        [ Red (B 0 0) (u, v) d
-        | u <- degree5 g
-        , v <- nbrs g u
-        , d <- [DLeft, DRight]
-        , isValidB00Reduction g (u, v) d
-        ]
+        if maxLen >= 2
+        then [ Red (B 0 0) (u, v) d
+             | u <- degree5 g
+             , v <- nbrs g u
+             , d <- [DLeft, DRight]
+             , isValidB00Reduction g (u, v) d
+             ]
+        else []
 
-    bigBReds = bentReductions maxLen g
+    bigBReds = if maxLen >= 3 then bentReductions maxLen g else []
 
 -- | Check if L0 direction is valid.
 -- Matches C's has_L0_reduction: flanking vertices 2 positions away
@@ -616,10 +626,11 @@ isValidB00Reduction g (u, v) dir =
     let pi' = computeBentZeroPath g (u, v) dir
         path = mainPath pi'
         par  = parallelPath pi'
-    in length (nub path) == length path
+        pathSet = IS.fromList path
+    in IS.size pathSet == length path    -- no duplicates (was O(L²) nub)
     && deg g (last path) == 5
     && head path /= last path
-    && null (path `intersect` par)
+    && IS.null (pathSet `IS.intersection` IS.fromList par)  -- was O(L²) intersect
 
 ---------------------------------------------------------------------
 -- Straight reduction enumeration (L_i, i >= 1)
@@ -649,15 +660,15 @@ straightReductions maxRedLen g =
 -- take priority). Includes cycle detection for longer paths.
 followStraightToFive :: DualGraph -> Vertex -> Vertex -> Int
                      -> Maybe (Vertex, Vertex, Int)
-followStraightToFive g u v maxDist = go u v 1 [u]
+followStraightToFive g u v maxDist = go u v 1 (IS.singleton u)
   where
     go from to dist visited
         | dist > maxDist = Nothing
-        | to `elem` visited = Nothing  -- cycle
+        | IS.member to visited = Nothing  -- cycle (was O(dist) elem)
         | deg g to == 5 = Just (to, from, dist)
         | otherwise =
             let next = straightAhead g DLeft to from  -- dir irrelevant at degree-6
-            in go to next (dist + 1) (to : visited)
+            in go to next (dist + 1) (IS.insert to visited)
 
 -- | Check if a straight reduction direction is valid (flanking degree-6).
 -- Matches C's has_L0_reduction / has_short_straight_reduction: the vertex
@@ -729,6 +740,152 @@ bentEndpointFlank g w prevW DLeft  = advanceCW g w prevW 2
 bentEndpointFlank g w prevW DRight = advanceCW g w prevW (deg g w - 2)
 
 ---------------------------------------------------------------------
+-- Bounding lemmas
+---------------------------------------------------------------------
+
+-- | Extract the pair of degree-5 vertices involved in a reduction.
+-- For L0: both vertices of the edge are degree-5.
+-- For L_i (i>=1): start vertex u and far endpoint (found by straight walk).
+-- For B_{0,0}: start vertex u and far endpoint of bent path.
+-- For B_{i,j} (i+j>0): start vertex u and far endpoint of bent path.
+reductionFiveVertices :: DualGraph -> Reduction -> (Vertex, Vertex)
+reductionFiveVertices g (Red (L 0) (u, v) _) = (u, v)
+reductionFiveVertices g (Red (L i) (u, v) _) =
+    case followStraightToFive g u v (i + 1) of
+        Just (w, _, _) -> (u, w)
+        Nothing        -> (u, u)  -- shouldn't happen for valid reduction
+reductionFiveVertices g (Red (B 0 0) (u, v) d) =
+    let pi' = computeBentZeroPath g (u, v) d
+    in (u, last (mainPath pi'))
+reductionFiveVertices g (Red (B i j) (u, v) d) =
+    case computeBentPathSafe g (u, v) d i (i + j) of
+        Just (PathInfo path _) -> (u, last path)
+        Nothing                -> (u, u)  -- shouldn't happen for valid reduction
+reductionFiveVertices _ (Red F _ _) = (-1, -1)  -- F has no 5-vertex pair
+
+-- | Compute the maximum expansion length for a graph, applying all
+-- bounding lemmas. The result is the maximum reduction length of any
+-- expansion worth trying. Compose via minimum — soundness is preserved.
+--
+-- C code: determine_max_pathlength_straight() (lines 4868-4966)
+maxExpansionLength :: Int -> DualGraph -> [Reduction] -> Int
+maxExpansionLength maxDV g reds =
+    let nv = numVertices g
+        -- Base: can't expand beyond target size.
+        -- L_i adds i+2 vertices, B_{i,j} adds i+j+3, so the worst case
+        -- (fewest vertices per reduction length) is L_i: redLen = i+1, adds i+2.
+        -- So maxRedLen such that nv + (maxRedLen+1) <= maxDV gives:
+        baseBound = maxDV - nv - 1
+
+        -- Geometric bound: expansion of reduction length d not canonical if
+        -- child has < 12 * f(floor((d-1)/2)) vertices,
+        -- where f(x) = 1 + (5/2)*x*(x+1).
+        -- Compute max d such that a child of size <= maxDV satisfies this.
+        geoMaxRedLen = last $ 1 : [ d | d <- [1..baseBound]
+                                      , let x = (d - 1) `div` 2
+                                            minChildVerts = 12 * (1 + (5 * x * (x + 1)) `div` 2)
+                                      , nv + d + 1 >= minChildVerts ]
+
+        hasL0  = any (\(Red k _ _) -> k == L 0) reds
+
+        -- Length-2 reductions: L1 and B00
+        len2Reds = [ r | r <- reds, reductionLength (redKind r) == 2 ]
+        -- Length-2 five-vertex pairs, deduplicated by sorted pair
+        len2Pairs = nub [ normalize (reductionFiveVertices g r) | r <- len2Reds ]
+          where normalize (a, b) = (min a b, max a b)
+
+        hasLen2 = not (null len2Pairs)
+
+        -- Lemma 3: L0 exists → max length 2
+        lemma3 = if hasL0 then Just 2 else Nothing
+
+        -- Lemma 5: ≥3 independent length-2 reductions (pairwise disjoint
+        -- 5-vertex sets) → max length 2
+        lemma5 = if hasThreeIndependent len2Pairs then Just 2 else Nothing
+
+        -- Lemma 4: ≥2 length-2 reductions with different 5-vertex sets
+        -- → max length 3
+        lemma4 = if length len2Pairs >= 2 then Just 3 else Nothing
+
+        -- Lemma 2: parent has reduction of length d ≤ 2 → children
+        -- have length ≤ d+2. With length-2 (L1/B00): max = 4
+        -- With length-1 (L0): max = 3 (subsumed by Lemma 3's tighter bound)
+        lemma2 = if hasLen2 then Just 4
+                 else if hasL0 then Just 3
+                 else Nothing
+
+        -- Lemma 6: Two L0 reductions with distance > 4 → children have L0
+        -- → max length 2
+        l0Pairs = nub [ normalize (reductionFiveVertices g r)
+                      | r <- reds, redKind r == L 0 ]
+          where normalize (a, b) = (min a b, max a b)
+        lemma6 = if hasTwoDistantL0s g l0Pairs then Just 2 else Nothing
+
+        allBounds = [baseBound, geoMaxRedLen]
+                 ++ catMaybes [lemma3, lemma5, lemma4, lemma2, lemma6]
+
+    in maximum [1, minimum allBounds]  -- at least 1
+
+-- | Check if there exist 3 pairs with pairwise disjoint vertex sets.
+-- C code: contains_three_indep_L1s / contains_three_indep_B00s
+-- Uses backtracking search: try taking each pair, then recurse.
+hasThreeIndependent :: [(Vertex, Vertex)] -> Bool
+hasThreeIndependent pairs
+    | length pairs < 3 = False
+    | otherwise = search 0 IS.empty 0
+  where
+    n = length pairs
+    search count _ _
+        | count >= 3 = True
+    search _ _ start
+        | start >= n = False
+    search count used start =
+        let (a, b) = pairs !! start
+        in if IS.member a used || IS.member b used
+           then search count used (start + 1)
+           else -- Try taking this pair
+                search (count + 1) (IS.insert a (IS.insert b used)) (start + 1)
+                -- If that doesn't find 3, try skipping this pair
+                || search count used (start + 1)
+
+-- | Check if two L0 reductions have BFS distance > 4 between their edge midpoints.
+-- C code: uses direct graph distance. We approximate with the condition that the
+-- two L0 edges share no vertex and their 5-vertex sets are far apart.
+-- More precisely: distance between two L0 reductions is the minimum distance
+-- between any vertex in one edge and any vertex in the other.
+hasTwoDistantL0s :: DualGraph -> [(Vertex, Vertex)] -> Bool
+hasTwoDistantL0s g pairs
+    | length pairs < 2 = False
+    | otherwise = any pairIsDistant [(p1, p2) | p1 <- pairs, p2 <- pairs, p1 < p2]
+  where
+    pairIsDistant ((a1, b1), (a2, b2)) =
+        let d = minimum [ bfsDistance g x y | x <- [a1, b1], y <- [a2, b2] ]
+        in d > 4
+
+-- | BFS distance between two vertices in the dual graph.
+-- Uses Data.Sequence for O(1) amortized enqueue (was O(n) with list append).
+bfsDistance :: DualGraph -> Vertex -> Vertex -> Int
+bfsDistance g src tgt
+    | src == tgt = 0
+    | otherwise  = go IS.empty (Seq.singleton (src, 0))
+  where
+    go visited queue = case viewl queue of
+        EmptyL -> maxBound
+        (v, d) :< rest
+            | v == tgt         -> d
+            | IS.member v visited -> go visited rest
+            | otherwise ->
+                let visited' = IS.insert v visited
+                    queue' = foldl' (\q w -> q |> (w, d + 1)) rest
+                             [w | w <- nbrs g v, not (IS.member w visited')]
+                in go visited' queue'
+
+catMaybes :: [Maybe a] -> [a]
+catMaybes [] = []
+catMaybes (Just x : xs) = x : catMaybes xs
+catMaybes (Nothing : xs) = catMaybes xs
+
+---------------------------------------------------------------------
 -- Canonical test
 ---------------------------------------------------------------------
 
@@ -752,7 +909,10 @@ isCanonical (Exp kind _ dir) parentNV g' =
         [] -> False
         _  -> minimum invOrds <= minimum allOrds
   where
-    allReds = allReductions g'
+    -- Only enumerate reductions up to the expansion's length: longer
+    -- reductions can never beat the inverse in lexicographic canonOrd
+    -- (since x0 = reductionLength is the first component).
+    allReds = allReductionsUpTo (reductionLength kind) g'
     numNew = numNewVertices kind
     newV1 = parentNV
     newV2 = parentNV + numNew - 1

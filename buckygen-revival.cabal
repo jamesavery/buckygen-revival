@@ -1,0 +1,44 @@
+cabal-version:   3.0
+name:            buckygen-revival
+version:         0.1.0.0
+synopsis:        Fullerene isomer generator (Haskell reimplementation of buckygen)
+license:         BSD-3-Clause
+
+common shared
+  default-language: GHC2021
+  ghc-options:      -Wall -Wno-unused-imports -Wno-name-shadowing
+  build-depends:
+    , base        >= 4.18 && < 5
+    , array       >= 0.5
+    , containers  >= 0.6
+    , vector      >= 0.13
+
+library
+  import:         shared
+  hs-source-dirs: src
+  exposed-modules:
+    Seeds
+    Expansion
+    Canonical
+    Spiral
+
+executable buckygen-test
+  import:         shared
+  hs-source-dirs: src
+  main-is:        TestCanonical.hs
+  other-modules:  Seeds, Expansion, Canonical, Spiral
+  ghc-options:    -O2 -rtsopts
+
+executable buckygen-generate
+  import:         shared
+  hs-source-dirs: src
+  main-is:        Generate.hs
+  other-modules:  Seeds, Expansion, Spiral
+  ghc-options:    -O2 -rtsopts
+
+executable buckygen-test-expansion
+  import:         shared
+  hs-source-dirs: src
+  main-is:        TestExpansion.hs
+  other-modules:  Seeds, Expansion
+  ghc-options:    -O2 -rtsopts

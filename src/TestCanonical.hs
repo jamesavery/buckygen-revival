@@ -9,7 +9,7 @@ import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Set (Set)
 import qualified Data.Set as Set
-import Data.List (sort, foldl', intercalate)
+import Data.List (sort, foldl', intercalate, isPrefixOf, partition)
 import System.Environment (getArgs)
 import Data.IORef
 import System.IO (hFlush, stdout)
@@ -124,22 +124,30 @@ reductionTests =
     ]
 
 ---------------------------------------------------------------------
+-- Configuration
+---------------------------------------------------------------------
+
+data Config = Config
+    { cfgMaxDV       :: !Int   -- max dual vertices (= C_n/2 + 2)
+    , cfgDebugSpiral :: !Bool  -- compute spiral keys for dedup checking
+    } deriving (Show)
+
+---------------------------------------------------------------------
 -- Per-size statistics
 ---------------------------------------------------------------------
 
 data SizeStats = SS
     { ssParents          :: !Int  -- parent graphs expanded at this size
-    , ssExpansionsAll    :: !Int  -- total expansion sites before Rule 2
+    , ssExpansionsAll    :: !Int  -- total expansion sites (after bounding, before Rule 2)
     , ssExpansionsR2     :: !Int  -- expansion sites after Rule 2 filtering
     , ssCanonPasses      :: !Int  -- passed canonical test
     , ssDedupCatches     :: !Int  -- passed canonical but caught by spiral dedup
-    , ssHasL0            :: !Int  -- parents with an L0 reduction
-    , ssExpsIfBounded    :: !Int  -- expansions that would survive Lemma 3 bound
+    , ssMaxLen           :: !Int  -- max expansion length used (from bounding lemmas)
     , ssRingExps         :: !Int  -- F (nanotube ring) expansions
     } deriving (Show)
 
 emptySS :: SizeStats
-emptySS = SS 0 0 0 0 0 0 0 0
+emptySS = SS 0 0 0 0 0 0 0
 
 addSS :: SizeStats -> SizeStats -> SizeStats
 addSS a b = SS (ssParents a + ssParents b)
@@ -147,8 +155,7 @@ addSS a b = SS (ssParents a + ssParents b)
                 (ssExpansionsR2 a + ssExpansionsR2 b)
                 (ssCanonPasses a + ssCanonPasses b)
                 (ssDedupCatches a + ssDedupCatches b)
-                (ssHasL0 a + ssHasL0 b)
-                (ssExpsIfBounded a + ssExpsIfBounded b)
+                (max (ssMaxLen a) (ssMaxLen b))
                 (ssRingExps a + ssRingExps b)
 
 ---------------------------------------------------------------------
@@ -156,68 +163,64 @@ addSS a b = SS (ssParents a + ssParents b)
 ---------------------------------------------------------------------
 
 data GenState = GS
-    { gsSeen   :: !(Set Spiral.GeneralSpiral)
-    , gsGraphs :: !(Map Int [DualGraph])
+    { gsSeen   :: !(Set Spiral.GeneralSpiral)  -- only populated with --spirals
+    , gsCounts :: !(Map Int Int)                -- isomer count per dual vertex count
+    , gsGraphs :: !(Map Int [DualGraph])        -- all generated graphs (always populated)
     , gsFailed :: !Int
     , gsStats  :: !(Map Int SizeStats)
     }
 
 emptyState :: GenState
-emptyState = GS Set.empty Map.empty 0 Map.empty
+emptyState = GS Set.empty Map.empty Map.empty 0 Map.empty
 
 addStat :: Int -> SizeStats -> GenState -> GenState
 addStat nv ss st = st { gsStats = Map.insertWith addSS nv ss (gsStats st) }
 
-generate :: Int -> GenState
-generate maxDV =
+generate :: Config -> GenState
+generate cfg =
     -- Compute automorphism groups for seeds
     let seedsWithAuts = [ (g, canonAuts (canonicalBFSAndGroup g))
                         | g <- [c20, c28, c30] ]
-    in foldl' (\st (g, auts) -> processTree maxDV st g auts) emptyState seedsWithAuts
+    in foldl' (\st (g, auts) -> processTree cfg st g auts) emptyState seedsWithAuts
 
 -- | Process a graph: record it, then expand its children.
 -- Takes the graph's automorphism group for Rule 2 filtering.
-processTree :: Int -> GenState -> DualGraph -> [Automorphism] -> GenState
-processTree maxDV st g auts
-    | numVertices g > maxDV = st
+processTree :: Config -> GenState -> DualGraph -> [Automorphism] -> GenState
+processTree cfg st g auts
+    | numVertices g > cfgMaxDV cfg = st
     | otherwise =
         let nv = numVertices g
-        in case generalSpiralKey g of
-            Just gs | Set.member gs (gsSeen st) ->
-                -- Dedup catch: should be 0 with correct Rule 2
-                addStat nv (emptySS { ssDedupCatches = 1 }) st
-            Just gs ->
-                let st' = st { gsSeen = Set.insert gs (gsSeen st)
-                             , gsGraphs = Map.insertWith (++) nv [g] (gsGraphs st)
-                             }
-                in expandChildren maxDV st' g auts
-            Nothing ->
-                st { gsFailed = gsFailed st + 1 }
+            record s = s { gsCounts = Map.insertWith (+) nv 1 (gsCounts s)
+                         , gsGraphs = Map.insertWith (++) nv [g] (gsGraphs s)
+                         }
+        in if cfgDebugSpiral cfg
+           then case generalSpiralKey g of
+               Just gs | Set.member gs (gsSeen st) ->
+                   addStat nv (emptySS { ssDedupCatches = 1 }) st
+               Just gs ->
+                   let st' = record st { gsSeen = Set.insert gs (gsSeen st) }
+                   in expandChildren cfg st' g auts
+               Nothing ->
+                   st { gsFailed = gsFailed st + 1 }
+           else expandChildren cfg (record st) g auts
 
 -- | Expand a graph's children using Rule 2 to filter equivalent expansions.
-expandChildren :: Int -> GenState -> DualGraph -> [Automorphism] -> GenState
-expandChildren maxDV st g auts =
-    let nv = numVertices g
+expandChildren :: Config -> GenState -> DualGraph -> [Automorphism] -> GenState
+expandChildren cfg st g auts =
+    let maxDV = cfgMaxDV cfg
+        nv = numVertices g
         allReds = allReductions g
-        hasL0 = any (\(Red k _ _) -> k == L 0) allReds
 
-        -- Current (unbounded) max length
-        maxLen = min (maxDV - nv + 2) 5
+        -- Apply bounding lemmas to get maximum expansion length
+        maxLen = maxExpansionLength maxDV g allReds
 
-        -- What Lemma 3 would give
-        boundedMaxLen = if hasL0 then min maxLen 3 else maxLen
-
-        -- All expansions before Rule 2
+        -- All expansions within the bound
         expsAll = expansions maxLen g
         numExpsAll = length expsAll
 
         -- Rule 2: filter to one per equivalence class
         expsR2 = filterByRule2 g auts expsAll
         numExpsR2 = length expsR2
-
-        -- Count how many are within the Lemma 3 bound
-        expsInBound = length [ e | e <- expsAll,
-                               reductionLength (expKind e) <= boundedMaxLen ]
 
         -- Apply canonical test to Rule-2-filtered expansions
         -- For each child that passes, also compute its automorphism group
@@ -244,13 +247,12 @@ expandChildren maxDV st g auts =
                         , ssExpansionsAll = numExpsAll
                         , ssExpansionsR2 = numExpsR2
                         , ssCanonPasses = numCanonPasses
-                        , ssHasL0 = if hasL0 then 1 else 0
-                        , ssExpsIfBounded = expsInBound
+                        , ssMaxLen = maxLen
                         , ssRingExps = numRing
                         }
         st' = addStat nv stats st
 
-    in foldl' (\s (g', childAuts) -> processTree maxDV s g' childAuts)
+    in foldl' (\s (g', childAuts) -> processTree cfg s g' childAuts)
               st' (childrenWithAuts ++ ringChildrenWithAuts)
 
 ---------------------------------------------------------------------
@@ -275,26 +277,29 @@ carbonAtoms dv = (dv - 2) * 2
 -- Generation count tests
 ---------------------------------------------------------------------
 
-generationTests :: Int -> (GenState, [TestResult])
-generationTests maxDV =
-    let st = generate maxDV
-        results = gsGraphs st
+generationTests :: Config -> (GenState, [TestResult])
+generationTests cfg =
+    let maxDV = cfgMaxDV cfg
+        st = generate cfg
+        counts = gsCounts st
         relevant = [ (dualVerts c, c, expected)
                    | (c, expected) <- knownCounts
                    , dualVerts c <= maxDV
                    ]
-        failedSpirals = gsFailed st
         tests = map (\(dv, cn, expected) ->
-            let found = length $ Map.findWithDefault [] dv results
+            let found = Map.findWithDefault 0 dv counts
             in if found == expected
                then Pass $ "C" ++ show cn ++ ": " ++ show found ++ " isomers"
                else Fail ("C" ++ show cn) $
                     "expected " ++ show expected ++ ", got " ++ show found
             ) relevant
-         ++ [if failedSpirals == 0
-             then Pass "No spiral failures"
-             else Fail "Spiral failures" $ show failedSpirals ++ " graphs failed"
-            ]
+         ++ if cfgDebugSpiral cfg
+            then let failedSpirals = gsFailed st
+                 in [if failedSpirals == 0
+                     then Pass "No spiral failures"
+                     else Fail "Spiral failures" $ show failedSpirals ++ " graphs failed"
+                    ]
+            else []
     in (st, tests)
 
 ---------------------------------------------------------------------
@@ -311,10 +316,10 @@ printStats maxDV st = do
 
     -- Header
     putStrLn $ padR 8 "DualV" ++ padR 8 "C_n" ++ padR 10 "Parents"
-            ++ padR 12 "ExpsAll" ++ padR 10 "Rule2" ++ padR 12 "Bounded"
-            ++ padR 10 "Canon" ++ padR 10 "Dedup" ++ padR 8 "HasL0"
-            ++ padR 8 "Ring"
-    putStrLn $ replicate 96 '-'
+            ++ padR 12 "Exps" ++ padR 10 "Rule2"
+            ++ padR 10 "Canon" ++ padR 10 "Dedup"
+            ++ padR 8 "MaxL" ++ padR 8 "Ring"
+    putStrLn $ replicate 84 '-'
 
     -- Per-size rows
     let relevantSizes = filter (<= maxDV) allSizes
@@ -326,50 +331,43 @@ printStats maxDV st = do
                ++ padR 10 (show (ssParents ss))
                ++ padR 12 (show (ssExpansionsAll ss))
                ++ padR 10 (show (ssExpansionsR2 ss))
-               ++ padR 12 (show (ssExpsIfBounded ss))
                ++ padR 10 (show (ssCanonPasses ss))
                ++ padR 10 (show (ssDedupCatches ss))
-               ++ padR 8 (show (ssHasL0 ss))
+               ++ padR 8 (show (ssMaxLen ss))
                ++ padR 8 (show (ssRingExps ss))
         ) relevantSizes
 
     -- Totals
     let totals = foldl' addSS emptySS (Map.elems stats)
-    putStrLn $ replicate 96 '-'
+    putStrLn $ replicate 84 '-'
     putStrLn $ padR 8 "TOTAL" ++ padR 8 ""
             ++ padR 10 (show (ssParents totals))
             ++ padR 12 (show (ssExpansionsAll totals))
             ++ padR 10 (show (ssExpansionsR2 totals))
-            ++ padR 12 (show (ssExpsIfBounded totals))
             ++ padR 10 (show (ssCanonPasses totals))
             ++ padR 10 (show (ssDedupCatches totals))
-            ++ padR 8 (show (ssHasL0 totals))
+            ++ padR 8 (show (ssMaxLen totals))
             ++ padR 8 (show (ssRingExps totals))
 
     -- Summary ratios
     let totalExpsAll = ssExpansionsAll totals
         totalExpsR2 = ssExpansionsR2 totals
-        boundedExps = ssExpsIfBounded totals
         canonPasses = ssCanonPasses totals
         dedupCatches = ssDedupCatches totals
         r2Saved = totalExpsAll - totalExpsR2
     putStrLn ""
-    putStrLn $ "Expansion sites before Rule 2: " ++ show totalExpsAll
-    putStrLn $ "Expansion sites after Rule 2:  " ++ show totalExpsR2
+    putStrLn $ "Expansion sites (bounded): " ++ show totalExpsAll
+    putStrLn $ "After Rule 2:              " ++ show totalExpsR2
             ++ " (Rule 2 eliminated " ++ show r2Saved
             ++ ", " ++ showPct r2Saved totalExpsAll ++ "%)"
-    putStrLn $ "Would survive Lemma 3 bound:   " ++ show boundedExps
-            ++ " (saves " ++ showPct (totalExpsAll - boundedExps) totalExpsAll
-            ++ "% of total)"
     putStrLn $ "Canon acceptance rate: " ++ show canonPasses ++ "/"
             ++ show totalExpsR2
-            ++ " (" ++ showPct canonPasses totalExpsR2 ++ "% of Rule-2-filtered)"
-    putStrLn $ "Dedup catches (should be 0 with correct Rule 2): "
-            ++ show dedupCatches
+            ++ " (" ++ showPct canonPasses totalExpsR2 ++ "%)"
+    putStrLn $ "Dedup catches: " ++ show dedupCatches
     if dedupCatches > 0
         then putStrLn $ "WARNING: Dedup caught " ++ show dedupCatches
                      ++ " duplicates — Rule 2 filtering incomplete"
-        else putStrLn "CONFIRMED: Rule 2 eliminated all duplicates"
+        else putStrLn "OK: zero duplicates"
 
 padR :: Int -> String -> String
 padR n s = s ++ replicate (max 0 (n - length s)) ' '
@@ -385,10 +383,14 @@ showPct n d = show (round (100.0 * fromIntegral n / fromIntegral d :: Double) ::
 main :: IO ()
 main = do
     args <- getArgs
-    let maxDV = case args of
+    let (flags, positional) = Data.List.partition ("--" `isPrefixOf`) args
+        spirals = "--spirals" `elem` flags
+        maxDV = case positional of
                   (s:_) -> read s
                   []    -> 22  -- C40
+        cfg = Config { cfgMaxDV = maxDV, cfgDebugSpiral = spirals }
 
+    putStrLn $ "Mode: " ++ if spirals then "debug (spiral dedup ON)" else "fast (spiral dedup OFF)"
     putStrLn "=== BFS Code Tests ==="
     runTests bfsTests
 
@@ -397,7 +399,7 @@ main = do
 
     putStrLn $ "\n=== Canonical Generation Tests (up to C"
              ++ show (carbonAtoms maxDV) ++ ") ==="
-    let (st, genTests) = generationTests maxDV
+    let (st, genTests) = generationTests cfg
     runTests genTests
 
     -- Print instrumentation

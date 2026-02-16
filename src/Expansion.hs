@@ -5,7 +5,7 @@ module Expansion
     , PathInfo(..)
     , inverse
       -- * Graph primitives
-    , nbrs, deg
+    , nbrAt, nbrs, deg
     , nextCW, prevCW, advanceCW, sideNbr, straightAhead, turnAhead
     , insertAfter, replaceNbr, removeNbr
       -- * Path computation
@@ -23,9 +23,13 @@ module Expansion
     , flipDir
     ) where
 
-import Seeds (DualGraph(..), EdgeList, initEdgeList)
+import Seeds (DualGraph(..), EdgeList, initEdgeList, mkDualGraph, mkDualGraphLite)
+import qualified Data.Array as A
+import Data.Array.Unboxed (UArray)
+import qualified Data.Array.Unboxed as UA
 import Data.IntMap.Strict (IntMap)
 import qualified Data.IntMap.Strict as IM
+import qualified Data.IntSet as IS
 import Data.List (sort, elemIndex, foldl', intersect, nub)
 import Data.Maybe (fromJust)
 
@@ -73,43 +77,48 @@ data PathInfo = PathInfo
 -- Graph primitives: cyclic neighbor list operations
 ---------------------------------------------------------------------
 
--- | Get the neighbor list of vertex u
+-- | O(1) unboxed access to the i-th CW neighbor of vertex u.
+nbrAt :: DualGraph -> Vertex -> Int -> Vertex
+nbrAt g u i = adjFlat g UA.! (u * 6 + i)
+{-# INLINE nbrAt #-}
+
+-- | Get the neighbor list of vertex u (O(1) via pre-built boxed Array).
 nbrs :: DualGraph -> Vertex -> [Vertex]
-nbrs g u = neighbours g IM.! u
+nbrs g u = adjArray g A.! u
 
--- | Degree of vertex u
+-- | Degree of vertex u (O(1) unboxed lookup).
 deg :: DualGraph -> Vertex -> Int
-deg g u = length (nbrs g u)
+deg g u = degFlat g UA.! u
+{-# INLINE deg #-}
 
--- | Find index of v in u's neighbor list
+-- | Find index of v in u's CW neighbor list.
+-- Linear scan over 5-6 contiguous unboxed Ints (faster than IntMap).
 indexOf :: DualGraph -> Vertex -> Vertex -> Int
-indexOf g u v = case elemIndex v (nbrs g u) of
-    Just i  -> i
-    Nothing -> error $ "indexOf: " ++ show v ++ " not in " ++ show u ++ "'s list " ++ show (nbrs g u)
+indexOf g u v = go 0
+  where
+    base = u * 6
+    d = deg g u
+    flat = adjFlat g
+    go i | i >= d    = error $ "indexOf: " ++ show v ++ " not in " ++ show u
+                             ++ "'s neighbors " ++ show (nbrs g u)
+         | flat UA.! (base + i) == v = i
+         | otherwise = go (i + 1)
+{-# INLINE indexOf #-}
 
--- | Next neighbor clockwise from v in u's neighbor list
+-- | Next neighbor clockwise from v in u's neighbor list.
 nextCW :: DualGraph -> Vertex -> Vertex -> Vertex
-nextCW g u v =
-    let ns = nbrs g u
-        n  = length ns
-        i  = indexOf g u v
-    in ns !! ((i + 1) `mod` n)
+nextCW g u v = nbrAt g u ((indexOf g u v + 1) `mod` deg g u)
+{-# INLINE nextCW #-}
 
--- | Previous neighbor (counter-clockwise) from v in u's neighbor list
+-- | Previous neighbor (counter-clockwise) from v in u's neighbor list.
 prevCW :: DualGraph -> Vertex -> Vertex -> Vertex
-prevCW g u v =
-    let ns = nbrs g u
-        n  = length ns
-        i  = indexOf g u v
-    in ns !! ((i - 1 + n) `mod` n)
+prevCW g u v = let d = deg g u in nbrAt g u ((indexOf g u v - 1 + d) `mod` d)
+{-# INLINE prevCW #-}
 
--- | Advance n positions clockwise from v in u's neighbor list
+-- | Advance n positions clockwise from v in u's neighbor list.
 advanceCW :: DualGraph -> Vertex -> Vertex -> Int -> Vertex
-advanceCW g u v n' =
-    let ns = nbrs g u
-        len = length ns
-        i   = indexOf g u v
-    in ns !! ((i + n') `mod` len)
+advanceCW g u v n' = nbrAt g u ((indexOf g u v + n') `mod` deg g u)
+{-# INLINE advanceCW #-}
 
 -- | Side neighbor: for DRight use prevCW, for DLeft use nextCW
 -- This gives the parallel-path vertex when looking from 'from' toward 'to'.
@@ -421,7 +430,7 @@ applyReduction (Exp (B i j) _ _) pi g = reduceBent g pi i (i + j)
 ---------------------------------------------------------------------
 
 applyL0 :: DualGraph -> PathInfo -> Dir -> DualGraph
-applyL0 g (PathInfo path par) dir = DG nv' adj' deg5' el'
+applyL0 g (PathInfo path par) dir = mkDualGraph nv' adj' deg5' el'
   where
     nv = numVertices g
     a  = nv          -- first new vertex (degree-5)
@@ -478,7 +487,7 @@ applyL0 g (PathInfo path par) dir = DG nv' adj' deg5' el'
 ---------------------------------------------------------------------
 
 reduceL0 :: DualGraph -> PathInfo -> DualGraph
-reduceL0 g (PathInfo path par) = DG nv' adj' deg5' (initEdgeList adj')
+reduceL0 g (PathInfo path par) = mkDualGraphLite nv' adj' deg5'
   where
     nv = numVertices g
     a  = nv - 2       -- first added vertex
@@ -519,7 +528,7 @@ reduceL0 g (PathInfo path par) = DG nv' adj' deg5' (initEdgeList adj')
 ---------------------------------------------------------------------
 
 applyStraight :: DualGraph -> PathInfo -> Dir -> Int -> DualGraph
-applyStraight g (PathInfo path par) dir pathlength = DG nv' adj' deg5' el'
+applyStraight g (PathInfo path par) dir pathlength = mkDualGraph nv' adj' deg5' el'
   where
     nv  = numVertices g
     nv' = nv + pathlength
@@ -579,7 +588,7 @@ applyStraight g (PathInfo path par) dir pathlength = DG nv' adj' deg5' el'
 ---------------------------------------------------------------------
 
 reduceStraight :: DualGraph -> PathInfo -> DualGraph
-reduceStraight g (PathInfo path par) = DG nv' adj' deg5' (initEdgeList adj')
+reduceStraight g (PathInfo path par) = mkDualGraphLite nv' adj' deg5'
   where
     -- Determine pathlength from the path array
     -- path has pathlength+1 entries, par has pathlength+1 entries
@@ -622,7 +631,7 @@ reduceStraight g (PathInfo path par) = DG nv' adj' deg5' (initEdgeList adj')
 ---------------------------------------------------------------------
 
 applyBentZero :: DualGraph -> PathInfo -> Dir -> DualGraph
-applyBentZero g (PathInfo path par) dir = DG nv' adj' deg5' el'
+applyBentZero g (PathInfo path par) dir = mkDualGraph nv' adj' deg5' el'
   where
     nv  = numVertices g
     a   = nv           -- degree-5
@@ -684,7 +693,7 @@ applyBentZero g (PathInfo path par) dir = DG nv' adj' deg5' el'
 ---------------------------------------------------------------------
 
 reduceBentZero :: DualGraph -> PathInfo -> DualGraph
-reduceBentZero g (PathInfo path par) = DG nv' adj' deg5' (initEdgeList adj')
+reduceBentZero g (PathInfo path par) = mkDualGraphLite nv' adj' deg5'
   where
     nv  = numVertices g
     a   = nv - 3;  b = nv - 2;  c = nv - 1
@@ -716,7 +725,7 @@ reduceBentZero g (PathInfo path par) = DG nv' adj' deg5' (initEdgeList adj')
 ---------------------------------------------------------------------
 
 applyBent :: DualGraph -> PathInfo -> Dir -> Int -> Int -> DualGraph
-applyBent g (PathInfo path par) dir bentPos bentLen = DG nv' adj' deg5' el'
+applyBent g (PathInfo path par) dir bentPos bentLen = mkDualGraph nv' adj' deg5' el'
   where
     nv  = numVertices g
     numNew = bentLen + 3
@@ -877,7 +886,7 @@ applyBent g (PathInfo path par) dir bentPos bentLen = DG nv' adj' deg5' el'
 ---------------------------------------------------------------------
 
 reduceBent :: DualGraph -> PathInfo -> Int -> Int -> DualGraph
-reduceBent g (PathInfo path par) bentPos bentLen = DG nv' adj' deg5' (initEdgeList adj')
+reduceBent g (PathInfo path par) bentPos bentLen = mkDualGraphLite nv' adj' deg5'
   where
     numNew = bentLen + 3
     nv  = numVertices g
@@ -1103,9 +1112,9 @@ computeBentPathSafe g (u0, v0) dir bentPos bentLen = result
                            ]
             Just (PathInfo allPath parVerts)
 
-    hasDups xs = length xs /= length (go [] xs)
-      where go seen [] = seen
-            go seen (x:rest) = if x `elem` seen then seen else go (x:seen) rest
+    hasDups xs = go IS.empty xs
+      where go _ []     = False
+            go s (x:rest) = IS.member x s || go (IS.insert x s) rest
 
 ---------------------------------------------------------------------
 -- F expansion: nanotube ring (adds 5 degree-6 vertices)
@@ -1218,7 +1227,7 @@ findNanotubeRing g
 -- outer = [o0, o1, o2, o3, o4] (the cap vertices, where outer[i]
 --         is between ring[i] and ring[(i+1)%5])
 applyRing :: DualGraph -> [Vertex] -> [Vertex] -> DualGraph
-applyRing g ring outer = DG nv' adj' deg5' el'
+applyRing g ring outer = mkDualGraph nv' adj' deg5' el'
   where
     nv  = numVertices g
     nv' = nv + 5
@@ -1276,7 +1285,7 @@ applyRing g ring outer = DG nv' adj' deg5' el'
 --                                   ring[(i+1)%5] -> newV[i]
 -- reduceRing undoes these replacements and deletes newV[0..4].
 reduceRing :: DualGraph -> [Vertex] -> [Vertex] -> DualGraph
-reduceRing g ring outer = DG nv' adj' deg5' (initEdgeList adj')
+reduceRing g ring outer = mkDualGraphLite nv' adj' deg5'
   where
     nv  = numVertices g
     nv' = nv - 5

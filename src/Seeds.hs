@@ -3,12 +3,18 @@ module Seeds
     ( DualGraph(..)
     , EdgeList
     , initEdgeList
+    , mkDualGraph
+    , mkDualGraphLite
     , decodePlanarCode
     , c20, c28, c30
     , iprSeeds, iprSeedsInvalidBoundary
     , validateDualGraph
     ) where
 
+import Data.Array (Array)
+import qualified Data.Array as A
+import Data.Array.Unboxed (UArray)
+import qualified Data.Array.Unboxed as UA
 import Data.IntMap.Strict (IntMap)
 import qualified Data.IntMap.Strict as IM
 import Data.List (sort)
@@ -28,12 +34,42 @@ initEdgeList = IM.map (\ns -> IM.fromList (zip ns [0..]))
 -- Every vertex has degree 5 or 6; exactly 12 have degree 5.
 data DualGraph = DG
     { numVertices :: !Int
-    , neighbours  :: !(IntMap [Int])   -- cyclic planar order
+    , neighbours  :: !(IntMap [Int])   -- IntMap for graph surgery
     , degree5     :: [Int]             -- the 12 degree-5 vertices, sorted
     , edgeList    :: !EdgeList         -- slot tracking for expansion ops
-    } deriving (Show)
+    , adjArray    :: !(Array Int [Int]) -- boxed: v → [neighbors] (for list-returning nbrs)
+    , adjFlat     :: !(UArray Int Int) -- flat unboxed: v*6+i → neighbor (hot-path navigation)
+    , degFlat     :: !(UArray Int Int) -- flat unboxed: v → degree
+    }
 
--- | Equality ignores edgeList (which depends on operation history).
+instance Show DualGraph where
+    show g = "DG {numVertices=" ++ show (numVertices g)
+          ++ ", degree5=" ++ show (degree5 g) ++ "}"
+
+-- | Constructor: builds DualGraph with flat unboxed Array caches.
+-- adjFlat: vertex v's i-th CW neighbor at index v*6+i (degree-5 vertices padded with -1).
+-- degFlat: vertex v's degree at index v.
+mkDualGraph :: Int -> IntMap [Int] -> [Int] -> EdgeList -> DualGraph
+mkDualGraph nv adj d5 el = DG nv adj d5 el aa af df
+  where
+    nbrLists = [adj IM.! v | v <- [0..nv-1]]
+    aa = A.listArray (0, nv-1) nbrLists
+    af = UA.listArray (0, nv*6-1) $ concatMap pad nbrLists
+    df = UA.listArray (0, nv-1) (map length nbrLists)
+    pad ns = take 6 (ns ++ repeat (-1))
+
+-- | Lightweight constructor for reductions (test use only).
+-- Skips EdgeList but still builds Array caches.
+mkDualGraphLite :: Int -> IntMap [Int] -> [Int] -> DualGraph
+mkDualGraphLite nv adj d5 = DG nv adj d5 IM.empty aa af df
+  where
+    nbrLists = [adj IM.! v | v <- [0..nv-1]]
+    aa = A.listArray (0, nv-1) nbrLists
+    af = UA.listArray (0, nv*6-1) $ concatMap pad nbrLists
+    df = UA.listArray (0, nv-1) (map length nbrLists)
+    pad ns = take 6 (ns ++ repeat (-1))
+
+-- | Equality ignores derived fields (edgeList, adjArray, degArray).
 instance Eq DualGraph where
     g1 == g2 = numVertices g1 == numVertices g2
             && neighbours g1 == neighbours g2
@@ -46,7 +82,7 @@ instance Eq DualGraph where
 --   then for each vertex 0..nv-1: 1-indexed neighbours in cyclic order, terminated by 0
 decodePlanarCode :: [Word8] -> DualGraph
 decodePlanarCode [] = error "decodePlanarCode: empty input"
-decodePlanarCode (nvByte : rest) = DG nv adj deg5s (initEdgeList adj)
+decodePlanarCode (nvByte : rest) = mkDualGraph nv adj deg5s (initEdgeList adj)
   where
     nv = fromIntegral nvByte
     adj = parseVertices 0 rest IM.empty
@@ -66,7 +102,10 @@ decodePlanarCode (nvByte : rest) = DG nv adj deg5s (initEdgeList adj)
 
 -- | Validate structural invariants of a DualGraph.
 validateDualGraph :: DualGraph -> Either String ()
-validateDualGraph (DG nv adj deg5s _el) = do
+validateDualGraph g = do
+    let nv = numVertices g
+        adj = neighbours g
+        deg5s = degree5 g
     -- All degrees are 5 or 6
     let degs = [length (adj IM.! v) | v <- [0..nv-1]]
     mapM_ (\(v, d) ->

@@ -1,14 +1,23 @@
-# Progress — Step 3: Canonical Construction Path (COMPLETE)
+# Progress — Buckygen Rewrite
 
-## Status: C60 generation CORRECT — Rule 2 COMPLETE, zero duplicates
+## Status: C60 generation CORRECT — Algorithm specification COMPLETE
+
+## Latest: BUCKYGEN-ALGORITHM.md written (2026-02-16)
+- Self-contained 954-line algorithm specification in `doc/BUCKYGEN-ALGORITHM.md`
+- Fills all 15 gaps identified in `doc/BUCKYPAPER.md` (paper analysis)
+- Designed to be implementable from scratch without any other reference
+- Covers: graph representation, seeds, expansions, reductions, canonical test (5-tuple),
+  Rule 2 orbit filtering, generation loop, bounding lemmas, worked example, validation data
 
 ## Reference Documents
-- `C-CODE-ALGORITHM.md` — **AUTHORITATIVE**: complete algorithm as reverse-engineered from C code
+- `BUCKYGEN-ALGORITHM.md` — **COMPLETE SPECIFICATION**: self-contained algorithm description
+- `C-CODE-ALGORITHM.md` — algorithm as reverse-engineered from C code
 - `BUCKYGEN-MAP.md` — mapping between paper, C code, and Haskell (function index, line numbers)
-- `buckygen_paper_source/` — original paper (has significant gaps; see C-CODE-ALGORITHM.md)
+- `BUCKYPAPER.md` — analysis of 15 gaps/errors in the original buckygen paper
+- `buckygen_paper_source/` — original paper (has significant gaps; see BUCKYPAPER.md)
 
 ## Files
-- `Seeds.hs` (920 lines) — Step 1 (complete) + EdgeList type, initEdgeList, 4-field DualGraph
+- `Seeds.hs` (920 lines) — Step 1 (complete) + EdgeList type, initEdgeList, 7-field DualGraph (IntMap + Array caches)
 - `Expansion.hs` (~1330 lines) — Core implementation including F (nanotube ring) expansion/reduction
 - `Spiral.hs` (297 lines) — Canonical generalized spiral computation
 - `Canonical.hs` (~770 lines) — McKay's canonical construction path test + automorphisms + Rule 2
@@ -105,13 +114,40 @@ an existing degree-5 vertex created spurious L0 reduction matches.
 
 ## Performance (C60 run)
 
+### Current (with all optimizations, 2026-02-16)
 ```
-Expansion sites before Rule 2: 1,246,398
-Expansion sites after Rule 2:    685,824 (Rule 2 eliminated 560,574, 45%)
-Would survive Lemma 3 bound:     923,864 (saves 26% of total)
-Canon acceptance rate:              5,764 / 685,824 (1%)
-Dedup catches:                          0
+Time: 12.1s  |  Allocation: 71 GB  |  Zero duplicates
+Expansion sites (bounded):     379,920
+After Rule 2:                  180,951 (Rule 2 eliminated 52%)
+Canon acceptance rate:           5,764 / 180,951 (3%)
 ```
+
+### Optimization history
+| Optimization | Time | Alloc | Speedup |
+|---|---|---|---|
+| Baseline (no bounds) | 310s | ~1 TB | 1.0x |
+| + Bounding lemmas 1-5 | 170s | 467 GB | 1.8x |
+| + allReductionsUpTo | 25.5s | 66.6 GB | **12.2x** |
+| + boxed Array caches | 23.5s | 66.6 GB | 13.2x |
+| + flat UArray (adjFlat/degFlat) | **12.1s** | 71 GB | **25.6x** |
+| C reference (buckygen.c) | 0.02s | — | ~15000x |
+
+Key wins:
+- `allReductionsUpTo`: Skip bent reduction enumeration when expansion length ≤ 2 (6.7x)
+- Flat `UArray Int Int` for navigation: unboxed contiguous memory, linear scan for
+  indexOf (5-6 entries), `nbrAt` = single array index. Eliminated all navigation
+  primitives from the profile (were 25%+ of time). (1.9x over boxed Array)
+- STUArray for BFS was a net negative (too many small mutable array allocations per
+  canonicity check). Reverted to pure IntMap BFS.
+- Remaining gap to C: ~600x
+
+### Profile distribution (C40, post flat UArray)
+```
+straightAhead 7.3%  |  isValidB00 5.4%  |  bfsDistance 5.0%  |  bfsCF.procNbrs 4.6%
+bentPath.adv 4.2%   |  hasDups 3.8%     |  bentZeroPath 3.1% |  bentPath 2.7%
+```
+Navigation primitives (indexOf, advanceCW, deg, nextCW, prevCW) have disappeared
+from the profile. Remaining time is distributed across algorithm logic and BFS.
 
 ## Key Decisions
 - Direction-specific canonical test (Bug #15) eliminates all duplicates without
@@ -119,7 +155,8 @@ Dedup catches:                          0
 - Spiral dedup remains as safety net but currently catches 0 duplicates
 
 ## Next Steps (in priority order)
-1. **Implement bounding lemmas** (Lemma 3 first: L0 → max pathlength 3)
-   - Saves 26% of expansion sites
-2. Step 4: Forest traversal with SearchMonad abstraction
-3. Step 5: Additional bounding lemmas (Lemmas 4, 5, 6)
+1. **Algorithmic optimization**: Avoid materializing full graphs — compute canonOrd
+   components lazily from the parent + expansion diff
+2. **Mutable representation**: ST-based graph for O(1) in-place surgery
+3. **BFS allocation**: Replace IntMap with UArray in BFS traversal
+4. **Forest traversal**: SearchMonad abstraction with parallel strategies
