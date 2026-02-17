@@ -11,6 +11,9 @@ common shared
     , base        >= 4.18 && < 5
     , array       >= 0.5
     , containers  >= 0.6
+    , deepseq     >= 1.4
+    , parallel    >= 3.2
+    , stm         >= 2.5
     , vector      >= 0.13
 
 library
@@ -22,13 +25,21 @@ library
     Canonical
     Spiral
     MutGraph
+    GenForest
 
 executable buckygen-test
   import:         shared
   hs-source-dirs: src
   main-is:        TestCanonical.hs
-  other-modules:  Seeds, Expansion, Canonical, Spiral, MutGraph
-  ghc-options:    -O2 -rtsopts
+  other-modules:  Seeds, Expansion, Canonical, Spiral, MutGraph, GenForest
+  ghc-options:    -O2 -threaded -rtsopts
+
+executable buckygen-par
+  import:         shared
+  hs-source-dirs: src
+  main-is:        BenchPar.hs
+  other-modules:  Seeds, Expansion, Canonical, MutGraph, GenForest
+  ghc-options:    -O2 -threaded -rtsopts
 
 executable buckygen-generate
   import:         shared
@@ -36,6 +47,13 @@ executable buckygen-generate
   main-is:        Generate.hs
   other-modules:  Seeds, Expansion, Spiral
   ghc-options:    -O2 -rtsopts
+
+executable buckygen-demo
+  import:         shared
+  hs-source-dirs: src
+  main-is:        DemoForest.hs
+  other-modules:  Seeds, Expansion, Canonical, MutGraph, GenForest
+  ghc-options:    -O2 -threaded -rtsopts
 
 executable buckygen-test-expansion
   import:         shared
