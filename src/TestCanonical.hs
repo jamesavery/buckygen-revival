@@ -6,6 +6,7 @@ import Canonical
 import Data.Array.Unboxed (UArray)
 import MutGraph (MutGraph, UndoInfo, newMutGraph, loadGraph, freezeGraph,
                  unsafeFreezeGraph, applyExpansionM, applyRingM, undoMutation)
+import qualified GenForest
 import qualified Spiral
 import qualified Data.IntMap.Strict as IM
 import Data.Map.Strict (Map)
@@ -503,6 +504,40 @@ showPct _ 0 = "N/A"
 showPct n d = show (round (100.0 * fromIntegral n / fromIntegral d :: Double) :: Int)
 
 ---------------------------------------------------------------------
+-- Pure forest cross-check
+---------------------------------------------------------------------
+
+forestTests :: Int -> Map Int Int -> [TestResult]
+forestTests maxDV mutCounts =
+    let gcfg = GenForest.mkConfig maxDV
+        pureCounts = GenForest.dfsCountBySize gcfg
+        sizes = sort $ Set.toList $ Set.fromList $
+                filter (<= maxDV) (Map.keys mutCounts ++ Map.keys pureCounts)
+    in [ let mc = Map.findWithDefault 0 nv mutCounts
+             pc = Map.findWithDefault 0 nv pureCounts
+         in if mc == pc
+            then Pass $ "C" ++ show (carbonAtoms nv) ++ " forest=" ++ show pc
+            else Fail ("C" ++ show (carbonAtoms nv) ++ " forest")
+                      ("MutGraph=" ++ show mc ++ " vs Forest=" ++ show pc)
+       | nv <- sizes
+       ]
+
+parForestTests :: Int -> Map Int Int -> Int -> [TestResult]
+parForestTests maxDV mutCounts parDepth =
+    let gcfg = GenForest.mkConfig maxDV
+        parCounts = GenForest.parCountBySize gcfg parDepth
+        sizes = sort $ Set.toList $ Set.fromList $
+                filter (<= maxDV) (Map.keys mutCounts ++ Map.keys parCounts)
+    in [ let mc = Map.findWithDefault 0 nv mutCounts
+             pc = Map.findWithDefault 0 nv parCounts
+         in if mc == pc
+            then Pass $ "C" ++ show (carbonAtoms nv) ++ " par=" ++ show pc
+            else Fail ("C" ++ show (carbonAtoms nv) ++ " par")
+                      ("MutGraph=" ++ show mc ++ " vs Par=" ++ show pc)
+       | nv <- sizes
+       ]
+
+---------------------------------------------------------------------
 -- Main
 ---------------------------------------------------------------------
 
@@ -511,6 +546,7 @@ main = do
     args <- getArgs
     let (flags, positional) = Data.List.partition ("--" `isPrefixOf`) args
         spirals = "--spirals" `elem` flags
+        parMode = "--par" `elem` flags
         maxDV = case positional of
                   (s:_) -> read s
                   []    -> 22  -- C40
@@ -519,7 +555,10 @@ main = do
                      , cfgMslTable = buildMaxStraightLengths maxDV
                      }
 
-    putStrLn $ "Mode: " ++ if spirals then "debug (spiral dedup ON)" else "fast (spiral dedup OFF)"
+    putStrLn $ "Mode: " ++ if spirals then "debug (spiral dedup ON)"
+                           else if parMode then "parallel (depth 2)"
+                           else "fast (spiral dedup OFF)"
+
     putStrLn "=== BFS Code Tests ==="
     runTests bfsTests
 
@@ -531,11 +570,27 @@ main = do
     let (st, genTests) = generationTests cfg
     runTests genTests
 
+    -- Cross-check: pure forest vs MutGraph generation
+    putStrLn $ "\n=== Pure Forest Cross-Check (up to C"
+             ++ show (carbonAtoms maxDV) ++ ") ==="
+    let fTests = forestTests maxDV (gsCounts st)
+    runTests fTests
+
+    -- Parallel cross-check (when --par flag is set)
+    pTests <- if parMode
+        then do
+            putStrLn $ "\n=== Parallel Forest (depth 2) Cross-Check (up to C"
+                     ++ show (carbonAtoms maxDV) ++ ") ==="
+            let pt = parForestTests maxDV (gsCounts st) 2
+            runTests pt
+            return pt
+        else return []
+
     -- Print instrumentation
     printStats maxDV st
 
     putStrLn ""
-    let allTests = bfsTests ++ reductionTests ++ genTests
+    let allTests = bfsTests ++ reductionTests ++ genTests ++ fTests ++ pTests
         allOk = all passed allTests
     if allOk
         then putStrLn "ALL TESTS PASSED"
