@@ -36,8 +36,9 @@ module Canonical
     , buildMaxStraightLengths
     , maxExpansionLength
     , reductionFiveVertices
-      -- * Instrumentation (temporary)
-    -- , bfsGroupGT, bfsGroupEQ, bfsGroupLT, bfsX4Evals
+      -- * Instrumented canonicity test
+    , CanonVerdict(..)
+    , isCanonicalV
     ) where
 
 import Seeds (DualGraph(..))
@@ -51,10 +52,6 @@ import Data.Array.Unboxed (UArray, (!), bounds, array, elems)
 import Data.Array.ST (STUArray, runSTUArray, newArray, readArray, writeArray, freeze)
 import Control.Monad (forM_)
 import Control.Monad.ST (ST, runST)
--- import Data.IORef                       -- was for instrumentation
--- import System.IO.Unsafe (unsafePerformIO) -- was for instrumentation
-
--- Instrumentation counters removed (were temporary for profiling)
 
 ---------------------------------------------------------------------
 -- Types
@@ -105,6 +102,11 @@ data CanonResult = CanonResult
     { canonCode  :: !BFSCode
     , canonAuts  :: ![Automorphism]   -- includes identity
     , canonNbop  :: !Int              -- count of orientation-preserving auts
+    , canonEdgesTotal    :: !Int      -- starting edges before colour filter
+    , canonEdgesFiltered :: !Int      -- starting edges after colour filter
+    , canonBfsGT :: !Int              -- BFS comparisons: GT (rejected)
+    , canonBfsEQ :: !Int              -- BFS comparisons: EQ (automorphism)
+    , canonBfsLT :: !Int              -- BFS comparisons: LT (new minimum)
     } deriving (Show)
 
 ---------------------------------------------------------------------
@@ -400,6 +402,28 @@ indexOfFlat flat w d v = go 0
          | otherwise = go (i + 1)
 {-# INLINE indexOfFlat #-}
 
+-- | Compute the "first-row colour" for starting edge (u, v, dir).
+-- The first row of the BFS code is entirely determined by deg(u) and the
+-- degree sequence of u's non-v neighbors in BFS traversal order. Since
+-- all degrees are 5 or 6, we pack this into a single Int:
+--   bits = deg(u) * 32 + binary encoding of neighbor degrees (0=deg5, 1=deg6)
+-- This preserves lexicographic ordering of the first BFS row.
+-- Only edges with the minimum edgeColour can produce the minimum full BFS code.
+edgeColour :: UArray Int Int -> UArray Int Int -> Int -> Int -> Dir -> Int
+edgeColour flat dfl u v dir = dU * 32 + go startIdx (dU - 1) 0
+  where
+    dU = dfl ! u
+    step = case dir of { DRight -> 1; DLeft -> -1 }
+    refIdx = indexOfFlat flat u dU v
+    startIdx = (refIdx + step + dU) `mod` dU
+    go _ 0 acc = acc
+    go idx remaining acc =
+        let nbr = flat ! (u * 6 + idx)
+            bit = dfl ! nbr - 5   -- 0 for deg-5, 1 for deg-6
+            nextIdx = (idx + step + dU) `mod` dU
+        in go nextIdx (remaining - 1) (acc * 2 + bit)
+{-# INLINE edgeColour #-}
+
 -- | Compute BFS canonical form starting from directed edge (u -> v)
 -- walking in direction dir.
 --
@@ -528,6 +552,11 @@ walkNbrs step flat dfl maxN numArr queueV queueR codeArr
 -- Matches C code's canon() (lines 3267-3402): pre-allocates work arrays
 -- in a single runST block, does interleaved BFS + comparison (like testcanon),
 -- aborting early for GT cases (~99%). Only freezes numbering for automorphisms.
+--
+-- Optimization: edge colour pre-filter. The first BFS row is determined by
+-- deg(u) and the degree pattern of u's neighbors. Only edges with the minimum
+-- first-row colour can produce the minimum BFS code. This typically reduces
+-- starting edges from ~390 to ~20 (at nv=35).
 canonicalBFSAndGroup :: DualGraph -> CanonResult
 canonicalBFSAndGroup g = runST $ do
     let nv = numVertices g
@@ -535,11 +564,18 @@ canonicalBFSAndGroup g = runST $ do
         maxN = nv + 1
         flat = adjFlat g
         dfl = degFlat g
-        allStarts = [ (u, flat ! (u * 6 + i), d)
-                    | u <- [0..nv-1]
-                    , i <- [0 .. dfl ! u - 1]
-                    , d <- [DLeft, DRight]
-                    ]
+        -- Edge colour pre-filter: compute first-row colour for each starting
+        -- edge, keep only those with the minimum colour.
+        allWithColour = [ (edgeColour flat dfl u v d, (u, v, d))
+                        | u <- [0..nv-1]
+                        , i <- [0 .. dfl ! u - 1]
+                        , let v = flat ! (u * 6 + i)
+                        , d <- [DLeft, DRight]
+                        ]
+        !minCol = minimum (map fst allWithColour)
+        allStarts = [s | (c, s) <- allWithColour, c == minCol]
+        !nTotal = length allWithColour
+        !nFiltered = length allStarts
 
     -- Pre-allocate reusable work arrays (like C's stack-allocated arrays)
     numArr  <- newArray (0, nv - 1) 0     :: ST s (STUArray s Int Int)
@@ -621,18 +657,19 @@ canonicalBFSAndGroup g = runST $ do
             nm0 <- freezeNum numArr
             clearNum nv
 
-            -- Main loop: compare each starting edge against best
-            let go bestCode matches [] = return (bestCode, matches)
-                go bestCode matches ((u,v,d):rs) = do
+            -- Main loop: compare each starting edge against best.
+            -- Track GT/EQ/LT counts for instrumentation.
+            let go bestCode matches gtC eqC ltC [] = return (bestCode, matches, gtC, eqC, ltC)
+                go bestCode matches gtC eqC ltC ((u,v,d):rs) = do
                     (ord, lastNum) <- compareBFS u v d bestCode
                     case ord of
                         GT -> do
                             clearNum lastNum
-                            go bestCode matches rs
+                            go bestCode matches (gtC+1) eqC ltC rs
                         EQ -> do
                             nm <- freezeNum numArr
                             clearNum lastNum
-                            go bestCode ((nm, d) : matches) rs
+                            go bestCode ((nm, d) : matches) gtC (eqC+1) ltC rs
                         LT -> do
                             -- New minimum found. Redo full BFS (rare).
                             clearNum lastNum
@@ -640,9 +677,9 @@ canonicalBFSAndGroup g = runST $ do
                             newBest <- freezeNum codeArr
                             nm <- freezeNum numArr
                             clearNum nv
-                            go newBest [(nm, d)] rs
+                            go newBest [(nm, d)] gtC eqC (ltC+1) rs
 
-            (bestCode, matches) <- go bestRef [(nm0, d0)] rest
+            (bestCode, matches, gtCount, eqCount, ltCount) <- go bestRef [(nm0, d0)] 0 0 0 rest
 
             -- Build automorphisms from UArray numberings
             let (refNumMap, bestDir) = head matches
@@ -658,6 +695,7 @@ canonicalBFSAndGroup g = runST $ do
                 nbop = length [a | a <- auts, autOrientation a == Preserving]
 
             return $ CanonResult (BFS bestCode) auts nbop
+                                 nTotal nFiltered gtCount eqCount ltCount
 
 -- | Walk neighbors comparing each BFS code element against a reference.
 -- Returns Left (Ordering, lastNumbered) on mismatch (early abort),
@@ -794,7 +832,9 @@ allReductionsUpTo maxLen g = l0Reds ++ lReds ++ b00Reds ++ bigBReds
     l0Reds =
         [ Red (L 0) (u, v) d
         | u <- degree5 g
-        , v <- filter (\w -> deg g w == 5) (nbrs g u)
+        , i <- [0 .. deg g u - 1]
+        , let v = nbrAt g u i
+        , deg g v == 5
         , d <- [DLeft, DRight]
         , isValidL0Direction g (u, v) d
         ]
@@ -805,7 +845,8 @@ allReductionsUpTo maxLen g = l0Reds ++ lReds ++ b00Reds ++ bigBReds
         if maxLen >= 2
         then [ Red (B 0 0) (u, v) d
              | u <- degree5 g
-             , v <- nbrs g u
+             , i <- [0 .. deg g u - 1]
+             , let v = nbrAt g u i
              , d <- [DLeft, DRight]
              , isValidB00Reduction g (u, v) d
              ]
@@ -819,7 +860,9 @@ allReductionsUpTo maxLen g = l0Reds ++ lReds ++ b00Reds ++ bigBReds
 hasAnyL0Reduction :: DualGraph -> Bool
 hasAnyL0Reduction g = any hasL0Edge (degree5 g)
   where
-    hasL0Edge u = any (\v -> deg g v == 5 && anyDir u v) (nbrs g u)
+    hasL0Edge u = any (\i -> let v = nbrAt g u i
+                             in deg g v == 5 && anyDir u v)
+                      [0 .. deg g u - 1]
     anyDir u v = isValidL0Direction g (u, v) DLeft
               || isValidL0Direction g (u, v) DRight
 
@@ -871,7 +914,8 @@ straightReductions :: Int -> DualGraph -> [Reduction]
 straightReductions maxRedLen g =
     [ Red (L (dist - 1)) (u, v) d
     | u <- degree5 g
-    , v <- nbrs g u
+    , i <- [0 .. deg g u - 1]
+    , let v = nbrAt g u i
     , deg g v /= 5  -- distance 1 = L0, handled separately
     , Just (w, prevW, dist) <- [followStraightToFive g u v maxRedLen]
     , d <- [DLeft, DRight]
@@ -920,7 +964,8 @@ bentReductions :: Int -> DualGraph -> [Reduction]
 bentReductions maxRedLen g =
     [ Red (B i j) (u, v) d
     | u <- degree5 g
-    , v <- nbrs g u
+    , k <- [0 .. deg g u - 1]
+    , let v = nbrAt g u k
     , d <- [DLeft, DRight]
     , bentLen <- [1 .. maxRedLen - 2]  -- i+j >= 1, i+j+2 <= maxRedLen
     , bentPos <- [0 .. bentLen]
@@ -1092,46 +1137,45 @@ catMaybes (Nothing : xs) = catMaybes xs
 -- Canonical test
 ---------------------------------------------------------------------
 
+-- | Verdict from canonical test with rejection reason for instrumentation.
+data CanonVerdict = CanonAccept | RejectL0Early | RejectNoInverse
+                  | RejectPhase1 | RejectPhase2
+    deriving (Eq, Show)
+
 -- | Check if an expansion produces a canonical child.
+isCanonical :: Expansion -> Int -> DualGraph -> Bool
+isCanonical e parentNV g' = isCanonicalV e parentNV g' == CanonAccept
+
+-- | Like isCanonical but returns the specific verdict for instrumentation.
 --
 -- After applying expansion e to graph g with parentNV vertices
 -- (producing child graph g'), checks whether e's inverse is the
 -- canonical reduction of g'.
 --
--- Two-phase comparison to minimize expensive BFS (x4) evaluations:
---   Phase 1: Compare (x0, x1, x2, x3) for all reductions — O(1) each.
---            If no inverse reduction ties for the minimum → reject.
---   Phase 2: Only for reductions tied at the minimum cheap tuple,
---            compute x4 (BFS canonical form) — O(n) each.
+-- Uses lazy short-circuiting to match C code's early-exit strategy:
+--   Guard 1: Longer inverse + L0 exists → reject immediately.
+--   Guard 2: No inverse reduction found → reject.
+--   Guard 3: any non-inverse has strictly better (x0,x1,x2,x3) → reject.
+--            `any` stops at the first better reduction (like C's `return 0`).
+--   Guard 4: No non-inverse ties the inverse at (x0,x1,x2,x3) → accept.
+--   Guard 5: BFS tiebreaker for the few tied reductions.
 --
--- This eliminates >99% of BFS evaluations that the single-phase
--- approach (`minimum` on full 5-tuples) would force.
-isCanonical :: Expansion -> Int -> DualGraph -> Bool
-isCanonical (Exp kind _ dir) parentNV g' =
-    -- Early exit: if inverse has reductionLength > 1 (i.e. L1, B00, or longer)
-    -- but the child has an L0 reduction (x0=1), the inverse can never be
-    -- canonical since L0's x0=1 always beats x0≥2 lexicographically.
-    if reductionLength kind > 1 && hasAnyL0Reduction g'
-    then False
-    else case inverseReds of
-        [] -> False
-        _  ->
-            let -- Phase 1: cheap (x0,x1,x2,x3) for all reductions
-                invCheaps = map (`cheapCanonOrd` g') inverseReds
-                allCheaps = map (`cheapCanonOrd` g') allReds
-                minAllCheap = minimum allCheaps
-                minInvCheap = minimum invCheaps
-            in if minInvCheap > minAllCheap
-               then False  -- non-inverse reduction strictly better at x0-x3
-               else
-                   -- Phase 2: x4 only for reductions tied at minimum x0-x3
-                   let tiedInv = [ r | (c, r) <- zip invCheaps inverseReds
-                                     , c == minAllCheap ]
-                       tiedAll = [ r | (c, r) <- zip allCheaps allReds
-                                     , c == minAllCheap ]
-                       minInvBFS = minimum (map (`redBFS` g') tiedInv)
-                       minAllBFS = minimum (map (`redBFS` g') tiedAll)
-                   in minInvBFS <= minAllBFS
+-- allReds yields L0 first, so for an L1/B00 inverse, guard 3 finds
+-- a better L0 reduction after examining just 1-3 reductions.
+isCanonicalV :: Expansion -> Int -> DualGraph -> CanonVerdict
+isCanonicalV (Exp kind _ dir) parentNV g'
+    -- Early exit: longer inverse but L0 exists → can never be canonical
+    | reductionLength kind > 1 && hasAnyL0Reduction g' = RejectL0Early
+    -- No inverse reduction in the child → reject
+    | null inverseReds = RejectNoInverse
+    -- Phase 1: any reduction strictly better than inverse at (x0,x1,x2,x3)?
+    -- `any` short-circuits: stops at the first better reduction.
+    | any (\r -> cheapCanonOrd r g' < invCheap) allReds = RejectPhase1
+    -- No non-inverse ties the inverse → inverse is the unique minimum
+    | null tiedNonInv = CanonAccept
+    -- Phase 2: BFS tiebreaker among reductions tied at invCheap
+    | minInvBFS <= minAllBFS = CanonAccept
+    | otherwise = RejectPhase2
   where
     -- Only enumerate reductions up to the expansion's length: longer
     -- reductions can never beat the inverse in lexicographic canonOrd
@@ -1140,7 +1184,6 @@ isCanonical (Exp kind _ dir) parentNV g' =
     numNew = numNewVertices kind
     newV1 = parentNV
     newV2 = parentNV + numNew - 1
-    newRange = [newV1 .. newV2]
 
     -- Bug #14: Both vertices of the reduction's starting edge must be
     -- within the newly-added vertex range (prevents spurious matches
@@ -1148,5 +1191,16 @@ isCanonical (Exp kind _ dir) parentNV g' =
     -- Bug #15: Direction must match the expansion's direction — the C
     -- code tests the specific directed edge, not all directions.
     isInverseRed (Red k (a, b) d) =
-        k == kind && a `elem` newRange && b `elem` newRange && d == dir
+        k == kind && a >= newV1 && a <= newV2
+                  && b >= newV1 && b <= newV2 && d == dir
     inverseReds = filter isInverseRed allReds
+
+    -- Cheapest canonical ordering among inverse reductions (1-4 items)
+    invCheap = minimum (map (`cheapCanonOrd` g') inverseReds)
+
+    -- Phase 2 (reached ~3% of the time): find tied non-inverse reductions
+    tiedNonInv = [ r | r <- allReds, not (isInverseRed r)
+                     , cheapCanonOrd r g' == invCheap ]
+    tiedInv    = [ r | r <- inverseReds, cheapCanonOrd r g' == invCheap ]
+    minInvBFS  = minimum (map (`redBFS` g') tiedInv)
+    minAllBFS  = minimum (map (`redBFS` g') (tiedInv ++ tiedNonInv))

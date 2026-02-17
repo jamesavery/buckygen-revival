@@ -5,7 +5,7 @@ import Expansion
 import Canonical
 import Data.Array.Unboxed (UArray)
 import MutGraph (MutGraph, UndoInfo, newMutGraph, loadGraph, freezeGraph,
-                 applyExpansionM, applyRingM, undoMutation)
+                 unsafeFreezeGraph, applyExpansionM, applyRingM, undoMutation)
 import qualified Spiral
 import qualified Data.IntMap.Strict as IM
 import Data.Map.Strict (Map)
@@ -151,10 +151,23 @@ data SizeStats = SS
     , ssDedupCatches     :: !Int  -- passed canonical but caught by spiral dedup
     , ssMaxLen           :: !Int  -- max expansion length used (from bounding lemmas)
     , ssRingExps         :: !Int  -- F (nanotube ring) expansions
+    -- Canonical test rejection breakdown
+    , ssRejectL0Early    :: !Int  -- rejected: L0 exists + longer inverse
+    , ssRejectNoInverse  :: !Int  -- rejected: no inverse reduction found
+    , ssRejectPhase1     :: !Int  -- rejected: cheaper reduction found (x0-x3)
+    , ssRejectPhase2     :: !Int  -- rejected: BFS tiebreaker lost
+    , ssSkippedSize      :: !Int  -- skipped: child would exceed target size
+    -- BFS automorphism group stats (from canonicalBFSAndGroup)
+    , ssCanonBfsCalls    :: !Int  -- number of canonicalBFSAndGroup calls
+    , ssBfsEdgesTotal    :: !Int  -- total starting edges (before colour filter)
+    , ssBfsEdgesFiltered :: !Int  -- starting edges after colour filter
+    , ssBfsGT            :: !Int  -- BFS comparisons: GT (rejected)
+    , ssBfsEQ            :: !Int  -- BFS comparisons: EQ (automorphism)
+    , ssBfsLT            :: !Int  -- BFS comparisons: LT (new minimum)
     } deriving (Show)
 
 emptySS :: SizeStats
-emptySS = SS 0 0 0 0 0 0 0
+emptySS = SS 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
 
 addSS :: SizeStats -> SizeStats -> SizeStats
 addSS a b = SS (ssParents a + ssParents b)
@@ -164,6 +177,17 @@ addSS a b = SS (ssParents a + ssParents b)
                 (ssDedupCatches a + ssDedupCatches b)
                 (max (ssMaxLen a) (ssMaxLen b))
                 (ssRingExps a + ssRingExps b)
+                (ssRejectL0Early a + ssRejectL0Early b)
+                (ssRejectNoInverse a + ssRejectNoInverse b)
+                (ssRejectPhase1 a + ssRejectPhase1 b)
+                (ssRejectPhase2 a + ssRejectPhase2 b)
+                (ssSkippedSize a + ssSkippedSize b)
+                (ssCanonBfsCalls a + ssCanonBfsCalls b)
+                (ssBfsEdgesTotal a + ssBfsEdgesTotal b)
+                (ssBfsEdgesFiltered a + ssBfsEdgesFiltered b)
+                (ssBfsGT a + ssBfsGT b)
+                (ssBfsEQ a + ssBfsEQ b)
+                (ssBfsLT a + ssBfsLT b)
 
 ---------------------------------------------------------------------
 -- Canonical generation with Rule 2 + instrumentation
@@ -233,43 +257,77 @@ expandChildrenST cfg mg st g auts = do
         expsR2 = filterByRule2 g auts expsAll
         numExpsR2 = length expsR2
 
-    -- Process each expansion with apply/freeze/test/undo
-    (st1, numCanonPasses) <- foldM (\(s, cnt) e -> do
+    -- Process each expansion with apply/freeze/test/undo.
+    -- Accumulate (GenState, SizeStats) to track rejection breakdown.
+    (st1, loopSS) <- foldM (\(s, ss) e -> do
         let newVerts = numNewVertices (expKind e)
         if nv + newVerts > maxDV
-            then return (s, cnt)  -- child would exceed target size
+            then return (s, ss { ssSkippedSize = ssSkippedSize ss + 1 })
             else do
                 (undo, _) <- applyExpansionM mg e g
-                child <- freezeGraph mg
-                (s', cnt') <- if isCanonical e nv child
-                    then do
-                        let childAuts = canonAuts (canonicalBFSAndGroup child)
+                -- Zero-copy freeze for canonical test (97% reject, no copy needed).
+                -- isCanonicalV returns strict CanonVerdict; all graph reads complete
+                -- before undoMutation modifies the shared arrays.
+                childUnsafe <- unsafeFreezeGraph mg
+                let !verdict = isCanonicalV e nv childUnsafe
+                (s', ss') <- case verdict of
+                    CanonAccept -> do
+                        -- Safe copy for recursion (child used after further mutations)
+                        child <- freezeGraph mg
+                        let cr = canonicalBFSAndGroup child
+                            childAuts = canonAuts cr
+                            -- Force BFS stats before processTreeST mutates mg
+                            !bfsTotal = canonEdgesTotal cr
+                            !bfsFiltered = canonEdgesFiltered cr
+                            !bfsGT' = canonBfsGT cr
+                            !bfsEQ' = canonBfsEQ cr
+                            !bfsLT' = canonBfsLT cr
                         s'' <- processTreeST cfg mg s child childAuts
-                        return (s'', cnt + 1)
-                    else return (s, cnt)
+                        return (s'', ss { ssCanonPasses = ssCanonPasses ss + 1
+                                        , ssCanonBfsCalls = ssCanonBfsCalls ss + 1
+                                        , ssBfsEdgesTotal = ssBfsEdgesTotal ss + bfsTotal
+                                        , ssBfsEdgesFiltered = ssBfsEdgesFiltered ss + bfsFiltered
+                                        , ssBfsGT = ssBfsGT ss + bfsGT'
+                                        , ssBfsEQ = ssBfsEQ ss + bfsEQ'
+                                        , ssBfsLT = ssBfsLT ss + bfsLT'
+                                        })
+                    RejectL0Early ->
+                        return (s, ss { ssRejectL0Early = ssRejectL0Early ss + 1 })
+                    RejectNoInverse ->
+                        return (s, ss { ssRejectNoInverse = ssRejectNoInverse ss + 1 })
+                    RejectPhase1 ->
+                        return (s, ss { ssRejectPhase1 = ssRejectPhase1 ss + 1 })
+                    RejectPhase2 ->
+                        return (s, ss { ssRejectPhase2 = ssRejectPhase2 ss + 1 })
                 undoMutation mg undo
-                return (s', cnt')
-        ) (st, 0 :: Int) expsR2
+                return (s', ss')
+        ) (st, emptySS) expsR2
 
     -- F expansion for (5,0) nanotubes (always canonical)
-    (st2, numRing) <- case findNanotubeRing g of
+    (st2, ringSS) <- case findNanotubeRing g of
         Just (ring, outer) | nv + 5 <= maxDV -> do
             undo <- applyRingM mg ring outer
             child <- freezeGraph mg
-            let childAuts = canonAuts (canonicalBFSAndGroup child)
+            let cr = canonicalBFSAndGroup child
+                childAuts = canonAuts cr
             st' <- processTreeST cfg mg st1 child childAuts
             undoMutation mg undo
-            return (st', 1 :: Int)
-        _ -> return (st1, 0 :: Int)
+            return (st', emptySS { ssRingExps = 1, ssCanonPasses = 1
+                                 , ssCanonBfsCalls = 1
+                                 , ssBfsEdgesTotal = canonEdgesTotal cr
+                                 , ssBfsEdgesFiltered = canonEdgesFiltered cr
+                                 , ssBfsGT = canonBfsGT cr
+                                 , ssBfsEQ = canonBfsEQ cr
+                                 , ssBfsLT = canonBfsLT cr
+                                 })
+        _ -> return (st1, emptySS)
 
     -- Record stats for this parent
     let stats = emptySS { ssParents = 1
                         , ssExpansionsAll = numExpsAll
                         , ssExpansionsR2 = numExpsR2
-                        , ssCanonPasses = numCanonPasses
                         , ssMaxLen = maxLen
-                        , ssRingExps = numRing
-                        }
+                        } `addSS` loopSS `addSS` ringSS
     return $ addStat nv stats st2
 
 ---------------------------------------------------------------------
@@ -386,10 +444,59 @@ printStats maxDV st = do
                      ++ " duplicates — Rule 2 filtering incomplete"
         else putStrLn "OK: zero duplicates"
 
-    -- BFS instrumentation removed (was temporary for profiling)
+    -- Canonical test breakdown
+    let tested = canonPasses + ssRejectL0Early totals + ssRejectNoInverse totals
+                 + ssRejectPhase1 totals + ssRejectPhase2 totals
+        skipped = ssSkippedSize totals
+    putStrLn ""
+    putStrLn "=== Canonical Test Breakdown ==="
+    putStrLn $ "  isCanonical calls:         " ++ padL 10 (show tested)
+    putStrLn $ "    Accept:                  " ++ padL 10 (show canonPasses)
+            ++ "  (" ++ showPct canonPasses tested ++ "%)"
+    putStrLn $ "    Reject L0 early exit:    " ++ padL 10 (show (ssRejectL0Early totals))
+            ++ "  (" ++ showPct (ssRejectL0Early totals) tested ++ "%)"
+    putStrLn $ "    Reject no inverse:       " ++ padL 10 (show (ssRejectNoInverse totals))
+            ++ "  (" ++ showPct (ssRejectNoInverse totals) tested ++ "%)"
+    putStrLn $ "    Reject phase 1 (x0-x3):  " ++ padL 10 (show (ssRejectPhase1 totals))
+            ++ "  (" ++ showPct (ssRejectPhase1 totals) tested ++ "%)"
+    putStrLn $ "    Reject phase 2 (BFS):    " ++ padL 10 (show (ssRejectPhase2 totals))
+            ++ "  (" ++ showPct (ssRejectPhase2 totals) tested ++ "%)"
+    putStrLn $ "    Skipped (size limit):    " ++ padL 10 (show skipped)
+
+    -- BFS automorphism group stats
+    let bfsCalls = ssCanonBfsCalls totals
+        bfsTotal = ssBfsEdgesTotal totals
+        bfsFiltered = ssBfsEdgesFiltered totals
+        bfsGT_ = ssBfsGT totals
+        bfsEQ_ = ssBfsEQ totals
+        bfsLT_ = ssBfsLT totals
+        bfsCmp = bfsGT_ + bfsEQ_ + bfsLT_
+    putStrLn ""
+    putStrLn "=== BFS Automorphism Group ==="
+    putStrLn $ "  canonicalBFSAndGroup calls:" ++ padL 10 (show bfsCalls)
+    putStrLn $ "  Edge colour filter:"
+    putStrLn $ "    Total starting edges:    " ++ padL 10 (show bfsTotal)
+    putStrLn $ "    After filter:            " ++ padL 10 (show bfsFiltered)
+            ++ "  (" ++ showPct bfsFiltered bfsTotal ++ "%)"
+    if bfsCalls > 0
+        then putStrLn $ "    Avg per call:            "
+                ++ show (bfsTotal `div` bfsCalls) ++ " -> "
+                ++ show (bfsFiltered `div` bfsCalls)
+                ++ " (" ++ show (bfsTotal `div` max 1 bfsFiltered) ++ "x reduction)"
+        else return ()
+    putStrLn $ "  BFS comparison outcomes:"
+    putStrLn $ "    GT (rejected):           " ++ padL 10 (show bfsGT_)
+            ++ "  (" ++ showPct bfsGT_ bfsCmp ++ "%)"
+    putStrLn $ "    EQ (automorphism):       " ++ padL 10 (show bfsEQ_)
+            ++ "  (" ++ showPct bfsEQ_ bfsCmp ++ "%)"
+    putStrLn $ "    LT (new minimum):        " ++ padL 10 (show bfsLT_)
+            ++ "  (" ++ showPct bfsLT_ bfsCmp ++ "%)"
 
 padR :: Int -> String -> String
 padR n s = s ++ replicate (max 0 (n - length s)) ' '
+
+padL :: Int -> String -> String
+padL n s = replicate (max 0 (n - length s)) ' ' ++ s
 
 showPct :: Int -> Int -> String
 showPct _ 0 = "N/A"

@@ -2,7 +2,38 @@
 
 ## Status: C60 generation CORRECT — Algorithm specification COMPLETE
 
-## Latest: BUCKYGEN-ALGORITHM.md written (2026-02-16)
+## Latest: Selective unsafeFreezeGraph for rejected children (2026-02-17)
+
+### Avoid freezeGraph for rejected children
+- 97% of children fail `isCanonical` but previously each paid the O(7n) `freeze` cost
+- Added `unsafeFreezeGraph`: zero-copy alias of MutGraph's mutable arrays as immutable UArrays
+- Safe because `isCanonicalV` returns strict `CanonVerdict` (nullary constructors) — all graph
+  reads complete before `undoMutation` modifies the shared arrays
+- Only the 3% of children that pass `isCanonical` use safe `freezeGraph` (for recursion)
+- C60: 1.45s → 1.35s (7% speedup), 7.7GB → 7.5GB. C70: 7.73s → 7.06s (9% speedup), 43.0 → 41.6GB.
+
+## Previous: Comprehensive instrumentation + edge colour pre-filter (2026-02-17)
+
+### Edge colour pre-filter for canonicalBFSAndGroup
+- Computes "first-row colour" for each BFS starting edge: `deg(u)*32 + degree_pattern`
+- Only edges with the minimum colour can produce the minimum full BFS code
+- Filter effectiveness: 58x reduction at C60 (335→5.8 avg), 69x at C70 (390→5.6 avg)
+- Wall-clock improvement: ~5.6% (modest because interleaved BFS comparison already aborted cheaply)
+
+### Performance instrumentation
+- `CanonResult` now includes BFS stats: edges total/filtered, GT/EQ/LT comparison counts
+- `CanonVerdict` type for `isCanonicalV`: tracks rejection stage (L0Early/NoInverse/Phase1/Phase2)
+- `SizeStats` expanded with 11 new counters for complete generation pipeline analysis
+- All stats displayed in `printStats` with canonical test breakdown + BFS group analysis
+
+### Critical fix: `freezeGraph` switched from `unsafeFreeze` to safe `freeze`
+- `unsafeFreeze` caused data corruption when frozen graph arrays (aliasing MutGraph) were
+  read after `undoMutation` had restored parent state. The BFS stats fields in `CanonResult`
+  could be lazily evaluated after mutations, reading corrupted data.
+- Safe `freeze` copies the active array portion (~200 bytes per graph), adding only 3% overhead.
+- C60: 1.45s / 7.7GB (was 1.4s / 7.5GB). C70: 7.73s / 43.0GB (was 7.5s / 41.4GB).
+
+## Previous: BUCKYGEN-ALGORITHM.md written (2026-02-16)
 - Self-contained 954-line algorithm specification in `doc/BUCKYGEN-ALGORITHM.md`
 - Fills all 15 gaps identified in `doc/BUCKYPAPER.md` (paper analysis)
 - Designed to be implementable from scratch without any other reference
@@ -114,12 +145,13 @@ an existing degree-5 vertex created spurious L0 reduction matches.
 
 ## Performance (C60 run)
 
-### Current (with all optimizations, 2026-02-16)
+### Current (with selective unsafeFreezeGraph, 2026-02-17)
 ```
-Time: 12.1s  |  Allocation: 71 GB  |  Zero duplicates
-Expansion sites (bounded):     379,920
-After Rule 2:                  180,951 (Rule 2 eliminated 52%)
-Canon acceptance rate:           5,764 / 180,951 (3%)
+Time: 1.35s  |  Allocation: 7.5 GB  |  Peak mem: 75 MB  |  Zero duplicates
+Expansion sites (bounded):     380,060
+After Rule 2:                  180,958 (Rule 2 eliminated 52%)
+Canon acceptance rate:           5,767 / 180,958 (3%)
+C70: 7.06s / 41.6 GB / 30,579 isomers through C70
 ```
 
 ### Optimization history
@@ -129,17 +161,75 @@ Canon acceptance rate:           5,764 / 180,951 (3%)
 | + Bounding lemmas 1-5 | 170s | 467 GB | 1.8x |
 | + allReductionsUpTo | 25.5s | 66.6 GB | **12.2x** |
 | + boxed Array caches | 23.5s | 66.6 GB | 13.2x |
-| + flat UArray (adjFlat/degFlat) | **12.1s** | 71 GB | **25.6x** |
+| + flat UArray (adjFlat/degFlat) | 12.1s | 71 GB | **25.6x** |
+| + incremental BFS + IntSet fixes | 15.4s | 64 GB | **20.1x** |
+| + two-phase isCanonical | 13.8s | 57 GB | 22.5x |
+| + MutGraph (mutable surgery + unsafeFreeze) | 12.4s | 55 GB | 25.0x |
+| + profiling-guided fixes (3 below) | 4.2s | 35.2 GB | 73.8x |
+| + geometric table (remove BFS distance) | 2.5s | 17.3 GB | 124x |
+| + STUArray BFS + interleaved comparison | 2.0s | 12.1 GB | 155x |
+| + lazy isCanonical + nbrs elimination | 1.4s | 7.5 GB | 221x |
+| + edge colour pre-filter + instrumentation | 1.45s | 7.7 GB | 214x |
+| + selective unsafeFreezeGraph | **1.35s** | **7.5 GB** | **230x** |
 | C reference (buckygen.c) | 0.02s | — | ~15000x |
 
-Key wins:
+### Profiling-guided fixes (2026-02-17, 13.8s → 4.2s, 3.3x speedup)
+
+GHC profiling (`-fprof-auto`) revealed three major bottlenecks:
+
+1. **Parent allReductions used maxLen=5, only ≤2 needed** (27.5% time, 27.8% alloc)
+   `expandChildrenST` called `allReductions g` (= `allReductionsUpTo 5 g`), which
+   enumerates expensive bent reductions of length 3-5. But `maxExpansionLength` only
+   ever inspects L0 (length 1) and L1/B00 (length 2) reductions.
+   **Fix**: Changed to `allReductionsUpTo 2 g`.
+
+2. **isCanonical enumerated B00/L1 when L0 dominates** (19.5% time, 16.8% alloc)
+   When the inverse has reductionLength > 1 (L1, B00, or longer) but the child has
+   an L0 reduction (x0=1), the inverse can never be canonical since x0=1 always beats
+   x0≥2 lexicographically. The old code still enumerated all B00 reductions.
+   **Fix**: Added `hasAnyL0Reduction` early exit in `isCanonical`.
+
+3. **bfsDistance traversed entire graph, only needed depth ≤ 5** (10.7% time, 20.9% alloc)
+   `hasTwoDistantL0s` calls `bfsDistance` to check if distance > 4, but the old BFS
+   visited every reachable vertex. Graphs at C60 have 32 dual vertices.
+   **Fix**: Added depth bound to `bfsDistanceBounded g src tgt 5`.
+
+Key wins (earlier):
 - `allReductionsUpTo`: Skip bent reduction enumeration when expansion length ≤ 2 (6.7x)
 - Flat `UArray Int Int` for navigation: unboxed contiguous memory, linear scan for
   indexOf (5-6 entries), `nbrAt` = single array index. Eliminated all navigation
   primitives from the profile (were 25%+ of time). (1.9x over boxed Array)
-- STUArray for BFS was a net negative (too many small mutable array allocations per
-  canonicity check). Reverted to pure IntMap BFS.
-- Remaining gap to C: ~600x
+- Incremental BFS in `canonicalBFSAndGroup`: instead of computing all ~360 BFS codes
+  then taking `minimum`, compare each candidate against best-so-far. Lazy list
+  comparison aborts most candidates after 1-3 elements. Peak memory dropped from
+  796 MB to 31 MB (25x). Key bug: `bestDir` must come from same match as `refNumMap`.
+- Two-phase `isCanonical`: Phase 1 compares cheap (x0-x3) tuples for all reductions.
+  Only reductions that tie the minimum cheap tuple proceed to Phase 2 (BFS). Reduces
+  x4 evaluations from 512K to 28K (18x). Overall speedup: 11% (BFS was only ~15% of
+  total work due to lazy list comparison aborting early in the old code).
+- IntSet for `isValidB00Reduction` (nub/intersect → O(L log L)),
+  `followStraightToFive` (elem → O(log n)), `bfsDistance` (Seq queue → O(n)).
+- STUArray BFS with interleaved comparison (matching C code's `testcanon` approach):
+  pre-allocate work arrays in a single `runST` block, compare each BFS element
+  against the reference during construction. GT cases (~99%) abort after 1-3 elements
+  with zero allocation. Only EQ (automorphisms) and LT (rare new minimum) freeze arrays.
+  Eliminated IntMap from BFS entirely. Also changed `Automorphism.autPerm` from
+  `IntMap Int` to `UArray Int Int` for O(1) permutation lookup.
+  C60: 2.5s → 2.0s (20%), 17.3GB → 12.1GB (30%). C70: 13.7s → 10.4s (24%).
+- Geometric table (doc/MAX_STRAIGHT_LENGTHS.md): precomputed `max_straight_lengths[nv]`
+  replaces BFS-based `hasTwoDistantL0s` (Lemma 6). O(1) table lookup vs O(k²·n) BFS.
+  C60: 4.2s → 2.5s (40%), 35.2GB → 17.3GB (51%).
+- Lazy `isCanonical` with `any` short-circuiting (matching C's `return 0` pattern):
+  reformulated `isCanonical` from `minimum (map cheapCanonOrd allReds)` (forces all) to
+  `any (\r -> cheapCanonOrd r < invCheap) allReds` (stops at first better). Guards cascade:
+  L0 early exit → null check → `any` phase 1 → tied check → BFS phase 2.
+  97% of calls reject after examining 1-5 reductions instead of all 20-60.
+  C60: 2.0s → 1.4s (30%), 12.1GB → 7.5GB (38%). C70: 10.4s → 7.5s (28%).
+- `nbrs` list elimination: replaced `v <- nbrs g u` (allocates 5-6 cons cells per call)
+  with indexed iteration `i <- [0..deg g u - 1], let v = nbrAt g u i` in all reduction
+  and expansion enumerations. Added `isAdj g u v` (direct flat-array scan) to replace
+  `v `elem` nbrs g u`. Eliminated `nbrs` from entire Canonical.hs hot path.
+- Remaining gap to C: ~70x
 
 ### Profile distribution (C40, post flat UArray)
 ```
@@ -155,8 +245,44 @@ from the profile. Remaining time is distributed across algorithm logic and BFS.
 - Spiral dedup remains as safety net but currently catches 0 duplicates
 
 ## Next Steps (in priority order)
-1. **Algorithmic optimization**: Avoid materializing full graphs — compute canonOrd
-   components lazily from the parent + expansion diff
-2. **Mutable representation**: ST-based graph for O(1) in-place surgery
-3. **BFS allocation**: Replace IntMap with UArray in BFS traversal
-4. **Forest traversal**: SearchMonad abstraction with parallel strategies
+
+### 1. DONE: Lazy incremental rejection in `isCanonical` + `nbrs` elimination
+
+Implemented 2026-02-17. C60: 2.0s → 1.4s (30%), 12.1GB → 7.5GB (38%).
+C70: 10.4s → 7.5s (28%), 65.2GB → 41.4GB (36%). See optimization history above.
+
+**What was done:**
+- Reformulated `isCanonical` from `minimum (map cheapCanonOrd allReds)` to guard-based
+  `any (\r -> cheapCanonOrd r < invCheap) allReds`. Five guards cascade: L0 early exit →
+  null check → `any` short-circuit (phase 1) → unique minimum check → BFS tiebreaker (phase 2).
+- Replaced `a `elem` newRange` with O(1) bounds check `a >= newV1 && a <= newV2`.
+- Replaced all `v <- nbrs g u` with indexed iteration `i <- [0..deg g u - 1], let v = nbrAt g u i`
+  in Canonical.hs (reduction enumerations) and Expansion.hs (expansion enumerations).
+- Added `isAdj :: DualGraph -> Vertex -> Vertex -> Bool` (direct flat-array scan) to
+  replace all `v `elem` nbrs g u` patterns. Eliminated `nbrs` from entire Canonical.hs.
+
+**Remaining from the analysis (not yet done):**
+- Path sharing via `AnnotatedRed` (eliminates 3x redundant path computation for B00)
+- Cross-type priority guards (`hasAnyL1Reduction` for B00 rejection)
+- Parent-to-child information carrying
+
+### 2. DONE: Colour-pair pre-filter for BFS
+
+Implemented 2026-02-17. 58x edge reduction at C60 (334→5.8 avg). See edge colour
+pre-filter section above.
+
+### 3. DONE: Avoid `freezeGraph` for rejected children
+
+Implemented 2026-02-17. Added `unsafeFreezeGraph` (zero-copy alias) for the 97% of
+children that fail `isCanonical`. Safe `freezeGraph` only for the 3% that pass.
+C60: 1.45s → 1.35s (7%), C70: 7.73s → 7.06s (9%).
+
+**Remaining optimization opportunities:**
+- Path sharing via `AnnotatedRed` (eliminates 3x redundant path computation for B00)
+- Cross-type priority guards (`hasAnyL1Reduction` for B00 rejection)
+- Parent-to-child information carrying
+- Remaining gap to C: ~67x
+
+### 4. Forest traversal
+
+SearchMonad abstraction with parallel strategies.

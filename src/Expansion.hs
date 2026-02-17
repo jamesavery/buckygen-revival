@@ -5,7 +5,7 @@ module Expansion
     , PathInfo(..)
     , inverse
       -- * Graph primitives
-    , nbrAt, nbrs, deg
+    , nbrAt, nbrs, deg, isAdj
     , nextCW, prevCW, advanceCW, sideNbr, straightAhead, turnAhead
     , insertAfter, replaceNbr, removeNbr
       -- * Path computation
@@ -105,6 +105,18 @@ indexOf g u v = go 0
          | flat UA.! (base + i) == v = i
          | otherwise = go (i + 1)
 {-# INLINE indexOf #-}
+
+-- | Check if v is a neighbor of u. Direct flat-array scan, no list allocation.
+isAdj :: DualGraph -> Vertex -> Vertex -> Bool
+isAdj g u v = go 0
+  where
+    d = deg g u
+    base = u * 6
+    flat = adjFlat g
+    go i | i >= d = False
+         | flat UA.! (base + i) == v = True
+         | otherwise = go (i + 1)
+{-# INLINE isAdj #-}
 
 -- | Next neighbor clockwise from v in u's neighbor list.
 nextCW :: DualGraph -> Vertex -> Vertex -> Vertex
@@ -964,7 +976,8 @@ expansionsL0 :: DualGraph -> [Expansion]
 expansionsL0 g =
     [ Exp (L 0) (u, v) d
     | u <- degree5 g
-    , v <- nbrs g u         -- v can be any degree (C code doesn't filter)
+    , i <- [0 .. deg g u - 1]   -- indexed iteration, no list allocation
+    , let v = nbrAt g u i
     , d <- [DLeft, DRight]
     , isValidStraightSite g (u, v) d 3
     ]
@@ -976,7 +989,8 @@ expansionsL :: Int -> DualGraph -> [Expansion]
 expansionsL maxLen g =
     [ Exp (L i) (u, v) d
     | u <- degree5 g
-    , v <- nbrs g u
+    , j <- [0 .. deg g u - 1]
+    , let v = nbrAt g u j
     , d <- [DLeft, DRight]
     , i <- [1 .. maxLen - 1]
     , let numE = i + 3
@@ -992,15 +1006,14 @@ isValidStraightSite g edge dir numEntries =
     let pi = computeStraightPath g edge dir numEntries
         p = mainPath pi
         q = parallelPath pi
-        isAdj u v = v `elem` nbrs g u
         pathlength = numEntries - 1
         qLast = last q
         -- path[k] must be adj to par[k-1] and par[k] (for replaceNbrEL)
-        pathAdj = all (\k -> isAdj (p!!k) (q!!(k-1))
-                          && isAdj (p!!k) (q!!k))
+        pathAdj = all (\k -> isAdj g (p!!k) (q!!(k-1))
+                          && isAdj g (p!!k) (q!!k))
                       [1..pathlength]
         -- par[k] must be adj to path[k+1] (for replaceNbrEL)
-        parAdj = all (\k -> isAdj (q!!k) (p!!(k+1))) [0..pathlength-1]
+        parAdj = all (\k -> isAdj g (q!!k) (p!!(k+1))) [0..pathlength-1]
     in deg g qLast == 5
     && null (p `intersect` q)
     && pathAdj && parAdj
@@ -1020,7 +1033,8 @@ expansionsB :: Int -> DualGraph -> [Expansion]
 expansionsB maxLen g =
     [ Exp (B i j) (u, v) d
     | u <- degree5 g
-    , v <- nbrs g u
+    , k <- [0 .. deg g u - 1]
+    , let v = nbrAt g u k
     , d <- [DLeft, DRight]
     , let maxBentLen = maxLen - 2  -- i+j+2 <= maxLen, so i+j <= maxLen-2
     , bentLen <- [0 .. maxBentLen]
@@ -1046,34 +1060,34 @@ canBentPath g (u0, v0) dir bentPos bentLen =
         Nothing -> False
         Just (PathInfo path par) ->
             let lastV = last path
-                isAdj u v = v `elem` nbrs g u
+                adj = isAdj g
                 bendI = bentPos + 2
                 -- Check all adjacencies required by applyBent replacements:
                 -- Before bend: path[k] adj par[k-1] and par[k]; par[k] adj path[k+1]
-                beforeOk = all (\k -> isAdj (path!!k) (par!!(k-1))
-                                   && isAdj (path!!k) (par!!k))
+                beforeOk = all (\k -> adj (path!!k) (par!!(k-1))
+                                   && adj (path!!k) (par!!k))
                                [1..bentPos+1]
-                parBeforeOk = all (\k -> (k == 0 || isAdj (par!!k) (path!!k))
-                                      && isAdj (par!!k) (path!!(k+1)))
+                parBeforeOk = all (\k -> (k == 0 || adj (par!!k) (path!!k))
+                                      && adj (par!!k) (path!!(k+1)))
                                   [0..bentPos]
                 -- Bend area: path[bendI] adj par[bendI-1];
                 -- par[bendI-1] adj path[bendI-1], path[bendI], path[bendI+1]
-                bendOk = isAdj (path!!bendI) (par!!(bendI-1))
-                      && isAdj (par!!(bendI-1)) (path!!(bendI-1))
-                      && isAdj (par!!(bendI-1)) (path!!bendI)
-                      && isAdj (par!!(bendI-1)) (path!!(bendI+1))
+                bendOk = adj (path!!bendI) (par!!(bendI-1))
+                      && adj (par!!(bendI-1)) (path!!(bendI-1))
+                      && adj (par!!(bendI-1)) (path!!bendI)
+                      && adj (par!!(bendI-1)) (path!!(bendI+1))
                 -- After bend: path[k] adj par[k-2] and par[k-1]
-                afterOk = all (\k -> isAdj (path!!k) (par!!(k-2))
-                                  && isAdj (path!!k) (par!!(k-1)))
+                afterOk = all (\k -> adj (path!!k) (par!!(k-2))
+                                  && adj (path!!k) (par!!(k-1)))
                               [bendI+1..bentLen+3]
                 -- par after bend: par[k] adj path[k+1] and path[k+2] (if k < bentLen+2)
-                parAfterOk = all (\k -> isAdj (par!!k) (path!!(k+1))
-                                     && (k >= bentLen+2 || isAdj (par!!k) (path!!(k+2))))
+                parAfterOk = all (\k -> adj (par!!k) (path!!(k+1))
+                                     && (k >= bentLen+2 || adj (par!!k) (path!!(k+2))))
                                  [bentPos+2..bentLen+2]
                 -- DLeft insertion at endpoint: par[bentLen+2] must be in path[bentLen+4]'s list
                 endpointOk = case dir of
                     DRight -> True  -- uses path[bentLen+3] which is always a neighbor
-                    DLeft  -> isAdj (path!!(bentLen+4)) (par!!(bentLen+2))
+                    DLeft  -> adj (path!!(bentLen+4)) (par!!(bentLen+2))
             in deg g lastV == 5
             && head path /= lastV
             && null (path `intersect` par)
@@ -1137,7 +1151,8 @@ findNanotubeRing g
     | otherwise = firstJust
         [ traceFromEdge u v
         | u <- deg6
-        , v <- nbrs g u
+        , i <- [0 .. deg g u - 1]
+        , let v = nbrAt g u i
         , deg g v == 6
         ]
   where
@@ -1174,7 +1189,8 @@ findNanotubeRing g
         let commonNbrs i =
                 let u = ring !! i
                     v = ring !! ((i + 1) `mod` 5)
-                in [w | w <- nbrs g u, w `elem` nbrs g v, w `notElem` ring]
+                in [w | j <- [0 .. deg g u - 1], let w = nbrAt g u j
+                      , isAdj g v w, w `notElem` ring]
             allCommon = map commonNbrs [0..4]
         in if any null allCommon
            then Nothing
@@ -1195,7 +1211,7 @@ findNanotubeRing g
         go outers i =
             let prev = last outers
                 candidates = allCommon !! i
-                pick = case filter (`elem` nbrs g prev) candidates of
+                pick = case filter (isAdj g prev) candidates of
                            (c:_) -> c
                            []    -> case candidates of
                                      [c] -> c
