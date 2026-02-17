@@ -13,6 +13,7 @@
 module Canonical
     ( -- * Types
       BFSCode(..)
+    , bfsCodeLength
     , CanOrd
     , Orientation(..)
     , Automorphism(..)
@@ -20,6 +21,7 @@ module Canonical
       -- * Canonicity test
     , canonOrd
     , allReductions
+    , allReductionsUpTo
     , isCanonical
       -- * BFS canonical form
     , bfsCanonicalForm
@@ -31,20 +33,28 @@ module Canonical
     , computeOtherTriple
     , filterByRule2
       -- * Bounding lemmas
+    , buildMaxStraightLengths
     , maxExpansionLength
     , reductionFiveVertices
+      -- * Instrumentation (temporary)
+    -- , bfsGroupGT, bfsGroupEQ, bfsGroupLT, bfsX4Evals
     ) where
 
 import Seeds (DualGraph(..))
 import Expansion
-import qualified Data.IntMap.Strict as IM
 import Data.IntSet (IntSet)
 import qualified Data.IntSet as IS
-import Data.List (nub, intersect, foldl')
+import Data.List (nub, foldl')
 import Data.Bits ((.|.), shiftL)
 import qualified Data.Set as Set
-import Data.Sequence (Seq, ViewL(..), viewl, (|>))
-import qualified Data.Sequence as Seq
+import Data.Array.Unboxed (UArray, (!), bounds, array, elems)
+import Data.Array.ST (STUArray, runSTUArray, newArray, readArray, writeArray, freeze)
+import Control.Monad (forM_)
+import Control.Monad.ST (ST, runST)
+-- import Data.IORef                       -- was for instrumentation
+-- import System.IO.Unsafe (unsafePerformIO) -- was for instrumentation
+
+-- Instrumentation counters removed (were temporary for profiling)
 
 ---------------------------------------------------------------------
 -- Types
@@ -52,7 +62,29 @@ import qualified Data.Sequence as Seq
 
 -- | BFS canonical form: a sequence of integers encoding the graph
 -- structure from a given starting edge and direction.
-newtype BFSCode = BFS [Int] deriving (Eq, Ord, Show)
+-- Stored as an unboxed array for O(1) access and zero list allocation.
+newtype BFSCode = BFS (UArray Int Int)
+
+instance Eq BFSCode where
+    BFS a == BFS b = a == b
+
+instance Ord BFSCode where
+    compare (BFS a) (BFS b) =
+        let (_, hi) = bounds a
+        in go 0 hi
+      where
+        go i hi'
+            | i > hi'   = EQ
+            | otherwise = case compare (a ! i) (b ! i) of
+                            EQ -> go (i + 1) hi'
+                            c  -> c
+
+instance Show BFSCode where
+    show (BFS arr) = "BFS " ++ show (elems arr)
+
+-- | Length of BFS code array.
+bfsCodeLength :: BFSCode -> Int
+bfsCodeLength (BFS arr) = let (lo, hi) = bounds arr in hi - lo + 1
 
 -- | Canonical ordering tuple. Smaller = more canonical.
 -- (reductionLength, negate longestStraight, colourPair, pathColour, BFS code)
@@ -64,7 +96,7 @@ data Orientation = Preserving | Reversing
 
 -- | An automorphism: vertex permutation + orientation.
 data Automorphism = Aut
-    { autPerm        :: !(IM.IntMap Int)  -- vertex → vertex
+    { autPerm        :: !(UArray Int Int)  -- vertex → vertex (O(1) lookup)
     , autOrientation :: !Orientation
     } deriving (Show)
 
@@ -335,9 +367,38 @@ canonOrd (Red kind (u, v) dir) g = (x0, x1, x2, x3, x4)
     x3 = thirdColour g kind (u, v) dir
     x4 = bfsCanonicalForm g u v dir
 
+-- | Cheap canonical ordering: only (x0, x1, x2, x3), no BFS.
+-- All four components are O(1) combinatorial invariants.
+-- Used by the two-phase isCanonical to avoid BFS for >99% of reductions.
+type CheapOrd = (Int, Int, (Int, Int), Int)
+
+cheapCanonOrd :: Reduction -> DualGraph -> CheapOrd
+cheapCanonOrd (Red kind (u, v) dir) g = (x0, x1, x2, x3)
+  where
+    x0 = reductionLength kind
+    x1 = negate (longestStraight kind)
+    x2 = secondColour g kind (u, v) dir
+    x3 = thirdColour g kind (u, v) dir
+
+-- | Extract just the BFS canonical form (x4) from a reduction.
+redBFS :: Reduction -> DualGraph -> BFSCode
+redBFS (Red _ (u, v) dir) g = bfsCanonicalForm g u v dir
+
 ---------------------------------------------------------------------
--- BFS Canonical Form
+-- BFS Canonical Form (STUArray-based, matching C code's approach)
 ---------------------------------------------------------------------
+
+-- | Find index of v in w's CW neighbor list (flat array).
+-- Linear scan over 5-6 entries. Used instead of Expansion.indexOf
+-- to avoid the module dependency and allow inlining.
+indexOfFlat :: UArray Int Int -> Int -> Int -> Int -> Int
+indexOfFlat flat w d v = go 0
+  where
+    base = w * 6
+    go i | i >= d    = error $ "indexOfFlat: " ++ show v ++ " not in " ++ show w
+         | flat ! (base + i) == v = i
+         | otherwise = go (i + 1)
+{-# INLINE indexOfFlat #-}
 
 -- | Compute BFS canonical form starting from directed edge (u -> v)
 -- walking in direction dir.
@@ -345,97 +406,116 @@ canonOrd (Red kind (u, v) dir) g = (x0, x1, x2, x3, x4)
 -- DRight = CW walk (matches C's testcanon_mirror, used with use_prev)
 -- DLeft  = CCW walk (matches C's testcanon, used with use_next)
 --
--- The BFS numbers vertices 1..nv starting from u=1, v=2.
--- For each vertex in BFS order, lists its neighbors in walk order.
--- Unnumbered vertices emit colour (degree + nv + 1); numbered emit
--- their number. Each vertex list is terminated by 0.
+-- Uses STUArray internally — no IntMap, no list allocation.
+-- Matches C code's testcanon/testcanon_mirror (lines 2246-2522).
 bfsCanonicalForm :: DualGraph -> Vertex -> Vertex -> Dir -> BFSCode
-bfsCanonicalForm g u v dir = BFS code
-  where
-    nv = numVertices g
-    maxN = nv + 1
-    vtxColour w = deg g w + maxN
+bfsCanonicalForm g u v dir = BFS $ runSTUArray $ do
+    let nv = numVertices g
+        codeLen = 6 * nv - 12
+        maxN = nv + 1
+        flat = adjFlat g
+        dfl = degFlat g
+        step = case dir of { DRight -> 1; DLeft -> -1 }
 
-    step = case dir of
-        DRight -> nextCW g
-        DLeft  -> prevCW g
+    numArr <- newArray (0, nv - 1) 0 :: ST s (STUArray s Int Int)
+    queueV <- newArray (1, nv) 0     :: ST s (STUArray s Int Int)
+    queueR <- newArray (1, nv) 0     :: ST s (STUArray s Int Int)
+    codeArr <- newArray (0, codeLen - 1) 0 :: ST s (STUArray s Int Int)
 
-    walkNeighbors w ref =
-        take (deg g w - 1) $ iterate (step w) (step w ref)
+    writeArray numArr u 1
+    writeArray numArr v 2
+    writeArray queueV 1 u
+    writeArray queueR 1 v
+    writeArray queueV 2 v
+    writeArray queueR 2 u
 
-    code = go (IM.fromList [(u, 1), (v, 2)])
-              (IM.fromList [(1, (u, v)), (2, (v, u))])
-              3 1
+    let process curNum nextNum codeIdx
+          | curNum > nv = return codeArr
+          | otherwise = do
+              w <- readArray queueV curNum
+              ref <- readArray queueR curNum
+              let d = dfl ! w
+                  refIdx = indexOfFlat flat w d ref
+                  startIdx = (refIdx + step + d) `mod` d
+              (nextNum', codeIdx') <-
+                  walkNbrs step flat dfl maxN numArr queueV queueR codeArr
+                           w d startIdx (d - 1) nextNum codeIdx
+              writeArray codeArr codeIdx' 0
+              process (curNum + 1) nextNum' (codeIdx' + 1)
 
-    go numMap refMap nextNum curNum
-        | curNum > nv = []
-        | otherwise =
-            let (w, ref) = refMap IM.! curNum
-                nbs = walkNeighbors w ref
-                (entries, numMap', refMap', nextNum') =
-                    processNeighbors w nbs numMap refMap nextNum
-            in entries ++ [0] ++ go numMap' refMap' nextNum' (curNum + 1)
-
-    processNeighbors _ [] numMap refMap nextNum =
-        ([], numMap, refMap, nextNum)
-    processNeighbors w (nbr:rest) numMap refMap nextNum =
-        case IM.lookup nbr numMap of
-            Just n ->
-                let (restE, nm', rm', nn') =
-                        processNeighbors w rest numMap refMap nextNum
-                in (n : restE, nm', rm', nn')
-            Nothing ->
-                let numMap' = IM.insert nbr nextNum numMap
-                    refMap' = IM.insert nextNum (nbr, w) refMap
-                    (restE, nm', rm', nn') =
-                        processNeighbors w rest numMap' refMap' (nextNum + 1)
-                in (vtxColour nbr : restE, nm', rm', nn')
+    process 1 3 0
 
 -- | BFS from a single starting edge, returning both code and vertex numbering.
+-- Returns (BFSCode, numArray) where numArray[v] = BFS number of vertex v.
 bfsWithNumbering :: DualGraph -> Vertex -> Vertex -> Dir
-                 -> (BFSCode, IM.IntMap Int)
-bfsWithNumbering g u v dir = (BFS code, finalNumMap)
-  where
-    nv = numVertices g
-    maxN = nv + 1
-    vtxColour w = deg g w + maxN
+                 -> (BFSCode, UArray Int Int)
+bfsWithNumbering g u v dir = runST $ do
+    let nv = numVertices g
+        codeLen = 6 * nv - 12
+        maxN = nv + 1
+        flat = adjFlat g
+        dfl = degFlat g
+        step = case dir of { DRight -> 1; DLeft -> -1 }
 
-    step = case dir of
-        DRight -> nextCW g
-        DLeft  -> prevCW g
+    numArr <- newArray (0, nv - 1) 0 :: ST s (STUArray s Int Int)
+    queueV <- newArray (1, nv) 0     :: ST s (STUArray s Int Int)
+    queueR <- newArray (1, nv) 0     :: ST s (STUArray s Int Int)
+    codeArr <- newArray (0, codeLen - 1) 0 :: ST s (STUArray s Int Int)
 
-    walkNeighbors w ref =
-        take (deg g w - 1) $ iterate (step w) (step w ref)
+    writeArray numArr u 1
+    writeArray numArr v 2
+    writeArray queueV 1 u
+    writeArray queueR 1 v
+    writeArray queueV 2 v
+    writeArray queueR 2 u
 
-    (code, finalNumMap) =
-        go (IM.fromList [(u, 1), (v, 2)])
-           (IM.fromList [(1, (u, v)), (2, (v, u))])
-           3 1
+    let process curNum nextNum codeIdx
+          | curNum > nv = return ()
+          | otherwise = do
+              w <- readArray queueV curNum
+              ref <- readArray queueR curNum
+              let d = dfl ! w
+                  refIdx = indexOfFlat flat w d ref
+                  startIdx = (refIdx + step + d) `mod` d
+              (nextNum', codeIdx') <-
+                  walkNbrs step flat dfl maxN numArr queueV queueR codeArr
+                           w d startIdx (d - 1) nextNum codeIdx
+              writeArray codeArr codeIdx' 0
+              process (curNum + 1) nextNum' (codeIdx' + 1)
 
-    go numMap refMap nextNum curNum
-        | curNum > nv = ([], numMap)
-        | otherwise =
-            let (w, ref) = refMap IM.! curNum
-                nbs = walkNeighbors w ref
-                (entries, numMap', refMap', nextNum') =
-                    processNbrs w nbs numMap refMap nextNum
-                (restCode, finalNM) = go numMap' refMap' nextNum' (curNum + 1)
-            in (entries ++ [0] ++ restCode, finalNM)
+    process 1 3 0
+    frozenCode <- freeze codeArr
+    frozenNum  <- freeze numArr
+    return (BFS frozenCode, frozenNum)
 
-    processNbrs _ [] numMap refMap nextNum =
-        ([], numMap, refMap, nextNum)
-    processNbrs w (nbr:rest) numMap refMap nextNum =
-        case IM.lookup nbr numMap of
-            Just n ->
-                let (restE, nm', rm', nn') =
-                        processNbrs w rest numMap refMap nextNum
-                in (n : restE, nm', rm', nn')
-            Nothing ->
-                let numMap' = IM.insert nbr nextNum numMap
-                    refMap' = IM.insert nextNum (nbr, w) refMap
-                    (restE, nm', rm', nn') =
-                        processNbrs w rest numMap' refMap' (nextNum + 1)
-                in (vtxColour nbr : restE, nm', rm', nn')
+-- | Walk neighbors of vertex w in BFS order, writing codes to codeArr.
+-- Shared between bfsCanonicalForm and bfsWithNumbering.
+-- Uses flat array index stepping (no indexOf per neighbor).
+walkNbrs :: Int -> UArray Int Int -> UArray Int Int -> Int
+         -> STUArray s Int Int -> STUArray s Int Int -> STUArray s Int Int
+         -> STUArray s Int Int
+         -> Int -> Int -> Int -> Int -> Int -> Int
+         -> ST s (Int, Int)
+walkNbrs step flat dfl maxN numArr queueV queueR codeArr
+         w d idx remaining nextNum codeIdx
+    | remaining <= 0 = return (nextNum, codeIdx)
+    | otherwise = do
+        let nbr = flat ! (w * 6 + idx)
+        num <- readArray numArr nbr
+        if num > 0
+            then do
+                writeArray codeArr codeIdx num
+                let nextIdx = (idx + step + d) `mod` d
+                walkNbrs step flat dfl maxN numArr queueV queueR codeArr
+                         w d nextIdx (remaining - 1) nextNum (codeIdx + 1)
+            else do
+                writeArray codeArr codeIdx (dfl ! nbr + maxN)
+                writeArray numArr nbr nextNum
+                writeArray queueV nextNum nbr
+                writeArray queueR nextNum w
+                let nextIdx = (idx + step + d) `mod` d
+                walkNbrs step flat dfl maxN numArr queueV queueR codeArr
+                         w d nextIdx (remaining - 1) (nextNum + 1) (codeIdx + 1)
 
 ---------------------------------------------------------------------
 -- Automorphism group computation
@@ -444,38 +524,172 @@ bfsWithNumbering g u v dir = (BFS code, finalNumMap)
 -- | Compute canonical BFS form and automorphism group.
 -- Tries all (vertex, neighbor, direction) starting configurations.
 -- Starting edges that produce the minimum BFS code define automorphisms.
+--
+-- Matches C code's canon() (lines 3267-3402): pre-allocates work arrays
+-- in a single runST block, does interleaved BFS + comparison (like testcanon),
+-- aborting early for GT cases (~99%). Only freezes numbering for automorphisms.
 canonicalBFSAndGroup :: DualGraph -> CanonResult
-canonicalBFSAndGroup g =
+canonicalBFSAndGroup g = runST $ do
     let nv = numVertices g
-        -- All starting configurations
-        allStarts = [ (u, v, d)
+        codeLen = 6 * nv - 12
+        maxN = nv + 1
+        flat = adjFlat g
+        dfl = degFlat g
+        allStarts = [ (u, flat ! (u * 6 + i), d)
                     | u <- [0..nv-1]
-                    , v <- nbrs g u
+                    , i <- [0 .. dfl ! u - 1]
                     , d <- [DLeft, DRight]
                     ]
-        -- Find minimum code and all matches
-        (bestCode, bestDir, matches) = findBest allStarts
-        -- Build inverse of the reference numbering (BFS number → vertex)
-        refNumMap = fst (head matches)  -- numbering of the best starting edge
-        refInv = IM.fromList [(n, v) | (v, n) <- IM.toList refNumMap]
-        -- Convert matches to automorphisms
-        auts = [ Aut perm ori
-               | (numMap, d) <- matches
-               , let perm = IM.map (\n -> refInv IM.! n) numMap
-                     ori = if d == bestDir then Preserving else Reversing
-               ]
-        nbop = length [a | a <- auts, autOrientation a == Preserving]
-    in CanonResult bestCode auts nbop
-  where
-    findBest starts =
-        let results = [ (code, numMap, d)
-                      | (u, v, d) <- starts
-                      , let (code, numMap) = bfsWithNumbering g u v d
-                      ]
-            bestCode = minimum [c | (c, _, _) <- results]
-            bestDir = head [d | (c, _, d) <- results, c == bestCode]
-            matches = [(numMap, d) | (c, numMap, d) <- results, c == bestCode]
-        in (bestCode, bestDir, matches)
+
+    -- Pre-allocate reusable work arrays (like C's stack-allocated arrays)
+    numArr  <- newArray (0, nv - 1) 0     :: ST s (STUArray s Int Int)
+    queueV  <- newArray (1, nv) 0         :: ST s (STUArray s Int Int)
+    queueR  <- newArray (1, nv) 0         :: ST s (STUArray s Int Int)
+    codeArr <- newArray (0, codeLen - 1) 0 :: ST s (STUArray s Int Int)
+
+    -- Freeze STUArray to UArray (type-disambiguated helper)
+    let freezeNum :: STUArray s Int Int -> ST s (UArray Int Int)
+        freezeNum = freeze
+
+    -- Clear only the numbered vertices in numArr (tracked via queueV)
+    let clearNum lastNum =
+            forM_ [1..lastNum] $ \k -> do
+                vtx <- readArray queueV k
+                writeArray numArr vtx 0
+
+    -- Full BFS: compute code into codeArr, numbering into numArr.
+    -- Returns the number of vertices numbered (= nv when complete).
+    let fullBFS u0 v0 dir0 = do
+            let step = case dir0 of { DRight -> 1; DLeft -> -1 }
+            writeArray numArr u0 1
+            writeArray numArr v0 2
+            writeArray queueV 1 u0
+            writeArray queueR 1 v0
+            writeArray queueV 2 v0
+            writeArray queueR 2 u0
+            let process curNum nextNum codeIdx
+                  | curNum > nv = return (nextNum - 1)
+                  | otherwise = do
+                      w <- readArray queueV curNum
+                      ref <- readArray queueR curNum
+                      let d = dfl ! w
+                          refIdx = indexOfFlat flat w d ref
+                          startIdx = (refIdx + step + d) `mod` d
+                      (nextNum', codeIdx') <-
+                          walkNbrs step flat dfl maxN numArr queueV queueR codeArr
+                                   w d startIdx (d - 1) nextNum codeIdx
+                      writeArray codeArr codeIdx' 0
+                      process (curNum + 1) nextNum' (codeIdx' + 1)
+            process 1 3 0
+
+    -- Interleaved BFS + comparison against refCode (like C's testcanon).
+    -- Returns (Ordering, lastNumbered). Aborts early on mismatch (GT/LT).
+    let compareBFS u0 v0 dir0 refCode = do
+            let step = case dir0 of { DRight -> 1; DLeft -> -1 }
+            writeArray numArr u0 1
+            writeArray numArr v0 2
+            writeArray queueV 1 u0
+            writeArray queueR 1 v0
+            writeArray queueV 2 v0
+            writeArray queueR 2 u0
+            let process curNum nextNum codeIdx
+                  | curNum > nv = return (EQ, nextNum - 1)
+                  | otherwise = do
+                      w <- readArray queueV curNum
+                      ref <- readArray queueR curNum
+                      let d = dfl ! w
+                          refIdx = indexOfFlat flat w d ref
+                          startIdx = (refIdx + step + d) `mod` d
+                      result <- walkCmp step flat dfl maxN numArr queueV queueR
+                                        refCode w d startIdx (d - 1) nextNum codeIdx
+                      case result of
+                          Left (ord, lastNum) -> return (ord, lastNum)
+                          Right (nextNum', codeIdx') -> do
+                              -- Check separator against refCode
+                              let refVal = refCode ! codeIdx'
+                              if 0 < refVal then return (LT, nextNum' - 1)
+                              else if 0 > refVal then return (GT, nextNum' - 1)
+                              else process (curNum + 1) nextNum' (codeIdx' + 1)
+            process 1 3 0
+
+    -- Process all starting edges
+    case allStarts of
+        [] -> error "canonicalBFSAndGroup: no starting edges"
+        ((u0,v0,d0):rest) -> do
+            _ <- fullBFS u0 v0 d0
+            bestRef <- freezeNum codeArr
+            nm0 <- freezeNum numArr
+            clearNum nv
+
+            -- Main loop: compare each starting edge against best
+            let go bestCode matches [] = return (bestCode, matches)
+                go bestCode matches ((u,v,d):rs) = do
+                    (ord, lastNum) <- compareBFS u v d bestCode
+                    case ord of
+                        GT -> do
+                            clearNum lastNum
+                            go bestCode matches rs
+                        EQ -> do
+                            nm <- freezeNum numArr
+                            clearNum lastNum
+                            go bestCode ((nm, d) : matches) rs
+                        LT -> do
+                            -- New minimum found. Redo full BFS (rare).
+                            clearNum lastNum
+                            _ <- fullBFS u v d
+                            newBest <- freezeNum codeArr
+                            nm <- freezeNum numArr
+                            clearNum nv
+                            go newBest [(nm, d)] rs
+
+            (bestCode, matches) <- go bestRef [(nm0, d0)] rest
+
+            -- Build automorphisms from UArray numberings
+            let (refNumMap, bestDir) = head matches
+                refInv = array (1, nv) [(refNumMap ! vv, vv) | vv <- [0..nv-1]]
+                         :: UArray Int Int
+                auts = [ Aut perm ori
+                       | (numMap, dd) <- matches
+                       , let perm = array (0, nv-1)
+                               [(vv, refInv ! (numMap ! vv)) | vv <- [0..nv-1]]
+                               :: UArray Int Int
+                             ori = if dd == bestDir then Preserving else Reversing
+                       ]
+                nbop = length [a | a <- auts, autOrientation a == Preserving]
+
+            return $ CanonResult (BFS bestCode) auts nbop
+
+-- | Walk neighbors comparing each BFS code element against a reference.
+-- Returns Left (Ordering, lastNumbered) on mismatch (early abort),
+-- Right (nextNum, codeIdx) when all neighbors matched.
+walkCmp :: Int -> UArray Int Int -> UArray Int Int -> Int
+        -> STUArray s Int Int -> STUArray s Int Int -> STUArray s Int Int
+        -> UArray Int Int
+        -> Int -> Int -> Int -> Int -> Int -> Int
+        -> ST s (Either (Ordering, Int) (Int, Int))
+walkCmp step flat dfl maxN numArr queueV queueR refCode
+        w d idx remaining nextNum codeIdx
+    | remaining <= 0 = return $ Right (nextNum, codeIdx)
+    | otherwise = do
+        let nbr = flat ! (w * 6 + idx)
+        num <- readArray numArr nbr
+        let val = if num > 0 then num else dfl ! nbr + maxN
+            refVal = refCode ! codeIdx
+        if val < refVal then return $ Left (LT, nextNum - 1)
+        else if val > refVal then return $ Left (GT, nextNum - 1)
+        else do
+            if num == 0
+                then do
+                    writeArray numArr nbr nextNum
+                    writeArray queueV nextNum nbr
+                    writeArray queueR nextNum w
+                    let nextIdx = (idx + step + d) `mod` d
+                    walkCmp step flat dfl maxN numArr queueV queueR refCode
+                            w d nextIdx (remaining - 1) (nextNum + 1) (codeIdx + 1)
+                else do
+                    let nextIdx = (idx + step + d) `mod` d
+                    walkCmp step flat dfl maxN numArr queueV queueR refCode
+                            w d nextIdx (remaining - 1) nextNum (codeIdx + 1)
 
 ---------------------------------------------------------------------
 -- Rule 2: Expansion orbit filtering
@@ -485,9 +699,9 @@ canonicalBFSAndGroup g =
 -- Orientation-preserving: keep direction. Orientation-reversing: flip direction.
 applyAutToExp :: Automorphism -> Expansion -> Expansion
 applyAutToExp (Aut sigma Preserving) (Exp kind (u, v) dir) =
-    Exp kind (sigma IM.! u, sigma IM.! v) dir
+    Exp kind (sigma ! u, sigma ! v) dir
 applyAutToExp (Aut sigma Reversing) (Exp kind (u, v) dir) =
-    Exp kind (sigma IM.! u, sigma IM.! v) (flipDir dir)
+    Exp kind (sigma ! u, sigma ! v) (flipDir dir)
 
 -- | Compute the "other triple" for an expansion — the expansion from the
 -- other endpoint of the central path that produces the same child graph.
@@ -598,6 +812,16 @@ allReductionsUpTo maxLen g = l0Reds ++ lReds ++ b00Reds ++ bigBReds
         else []
 
     bigBReds = if maxLen >= 3 then bentReductions maxLen g else []
+
+-- | Fast check: does the graph have any valid L0 reduction?
+-- Used for early exit in isCanonical: when the inverse has reductionLength > 1
+-- but the child has an L0 reduction (x0=1), the inverse can never be canonical.
+hasAnyL0Reduction :: DualGraph -> Bool
+hasAnyL0Reduction g = any hasL0Edge (degree5 g)
+  where
+    hasL0Edge u = any (\v -> deg g v == 5 && anyDir u v) (nbrs g u)
+    anyDir u v = isValidL0Direction g (u, v) DLeft
+              || isValidL0Direction g (u, v) DRight
 
 -- | Check if L0 direction is valid.
 -- Matches C's has_L0_reduction: flanking vertices 2 positions away
@@ -763,13 +987,31 @@ reductionFiveVertices g (Red (B i j) (u, v) d) =
         Nothing                -> (u, u)  -- shouldn't happen for valid reduction
 reductionFiveVertices _ (Red F _ _) = (-1, -1)  -- F has no 5-vertex pair
 
+-- | Precomputed table: max_straight_lengths[nv] = maximum possible minimum
+-- pentagon distance minus 1 for a fullerene dual with nv vertices.
+-- Matches C code's initialize_fuller_arrays() (lines 4732-4774).
+-- See doc/MAX_STRAIGHT_LENGTHS.md for the geometric argument.
+buildMaxStraightLengths :: Int -> UArray Int Int
+buildMaxStraightLengths maxNV = runSTUArray $ do
+    arr <- newArray (0, maxNV) 0
+    let go dist minReqPrev
+          | minReqPrev > maxNV = return arr
+          | otherwise =
+              let r = (dist - 1) `div` 2
+                  base = 12 * (1 + 5 * (r + 1) * r `div` 2)
+                  minReq = if even dist && dist > 2 then base + 20 else base
+              in do forM_ [minReqPrev .. min (minReq - 1) maxNV] $ \i ->
+                      writeArray arr i (dist - 1)
+                    go (dist + 1) minReq
+    go 1 0
+
 -- | Compute the maximum expansion length for a graph, applying all
 -- bounding lemmas. The result is the maximum reduction length of any
 -- expansion worth trying. Compose via minimum — soundness is preserved.
 --
 -- C code: determine_max_pathlength_straight() (lines 4868-4966)
-maxExpansionLength :: Int -> DualGraph -> [Reduction] -> Int
-maxExpansionLength maxDV g reds =
+maxExpansionLength :: Int -> UArray Int Int -> DualGraph -> [Reduction] -> Int
+maxExpansionLength maxDV mslTable g reds =
     let nv = numVertices g
         -- Base: can't expand beyond target size.
         -- L_i adds i+2 vertices, B_{i,j} adds i+j+3, so the worst case
@@ -777,14 +1019,14 @@ maxExpansionLength maxDV g reds =
         -- So maxRedLen such that nv + (maxRedLen+1) <= maxDV gives:
         baseBound = maxDV - nv - 1
 
-        -- Geometric bound: expansion of reduction length d not canonical if
-        -- child has < 12 * f(floor((d-1)/2)) vertices,
-        -- where f(x) = 1 + (5/2)*x*(x+1).
-        -- Compute max d such that a child of size <= maxDV satisfies this.
-        geoMaxRedLen = last $ 1 : [ d | d <- [1..baseBound]
-                                      , let x = (d - 1) `div` 2
-                                            minChildVerts = 12 * (1 + (5 * x * (x + 1)) `div` 2)
-                                      , nv + d + 1 >= minChildVerts ]
+        -- Table-based geometric bound (C code lines 4873-4882).
+        -- For each candidate pathlength p, check if a reduction of length p-1
+        -- is geometrically possible in a child with nv+p vertices.
+        -- Subsumes both the old geoMaxRedLen and Lemma 6 (hasTwoDistantL0s).
+        -- See doc/MAX_STRAIGHT_LENGTHS.md for the full analysis.
+        tableBound = last $ 1 : [ p | p <- [2..baseBound]
+                                    , nv + p <= maxDV
+                                    , p - 1 <= mslTable ! (nv + p) ]
 
         hasL0  = any (\(Red k _ _) -> k == L 0) reds
 
@@ -814,15 +1056,8 @@ maxExpansionLength maxDV g reds =
                  else if hasL0 then Just 3
                  else Nothing
 
-        -- Lemma 6: Two L0 reductions with distance > 4 → children have L0
-        -- → max length 2
-        l0Pairs = nub [ normalize (reductionFiveVertices g r)
-                      | r <- reds, redKind r == L 0 ]
-          where normalize (a, b) = (min a b, max a b)
-        lemma6 = if hasTwoDistantL0s g l0Pairs then Just 2 else Nothing
-
-        allBounds = [baseBound, geoMaxRedLen]
-                 ++ catMaybes [lemma3, lemma5, lemma4, lemma2, lemma6]
+        allBounds = [baseBound, tableBound]
+                 ++ catMaybes [lemma3, lemma5, lemma4, lemma2]
 
     in maximum [1, minimum allBounds]  -- at least 1
 
@@ -848,38 +1083,6 @@ hasThreeIndependent pairs
                 -- If that doesn't find 3, try skipping this pair
                 || search count used (start + 1)
 
--- | Check if two L0 reductions have BFS distance > 4 between their edge midpoints.
--- C code: uses direct graph distance. We approximate with the condition that the
--- two L0 edges share no vertex and their 5-vertex sets are far apart.
--- More precisely: distance between two L0 reductions is the minimum distance
--- between any vertex in one edge and any vertex in the other.
-hasTwoDistantL0s :: DualGraph -> [(Vertex, Vertex)] -> Bool
-hasTwoDistantL0s g pairs
-    | length pairs < 2 = False
-    | otherwise = any pairIsDistant [(p1, p2) | p1 <- pairs, p2 <- pairs, p1 < p2]
-  where
-    pairIsDistant ((a1, b1), (a2, b2)) =
-        let d = minimum [ bfsDistance g x y | x <- [a1, b1], y <- [a2, b2] ]
-        in d > 4
-
--- | BFS distance between two vertices in the dual graph.
--- Uses Data.Sequence for O(1) amortized enqueue (was O(n) with list append).
-bfsDistance :: DualGraph -> Vertex -> Vertex -> Int
-bfsDistance g src tgt
-    | src == tgt = 0
-    | otherwise  = go IS.empty (Seq.singleton (src, 0))
-  where
-    go visited queue = case viewl queue of
-        EmptyL -> maxBound
-        (v, d) :< rest
-            | v == tgt         -> d
-            | IS.member v visited -> go visited rest
-            | otherwise ->
-                let visited' = IS.insert v visited
-                    queue' = foldl' (\q w -> q |> (w, d + 1)) rest
-                             [w | w <- nbrs g v, not (IS.member w visited')]
-                in go visited' queue'
-
 catMaybes :: [Maybe a] -> [a]
 catMaybes [] = []
 catMaybes (Just x : xs) = x : catMaybes xs
@@ -895,19 +1098,40 @@ catMaybes (Nothing : xs) = catMaybes xs
 -- (producing child graph g'), checks whether e's inverse is the
 -- canonical reduction of g'.
 --
--- The inverse is identified by finding reductions in allReductions(g')
--- that have the same kind and start from one of the new degree-5
--- vertices (parentNV or parentNV + numNew - 1).
+-- Two-phase comparison to minimize expensive BFS (x4) evaluations:
+--   Phase 1: Compare (x0, x1, x2, x3) for all reductions — O(1) each.
+--            If no inverse reduction ties for the minimum → reject.
+--   Phase 2: Only for reductions tied at the minimum cheap tuple,
+--            compute x4 (BFS canonical form) — O(n) each.
 --
--- Bug #15: The C code's is_best_*_reduction tests the new edge in the
--- SPECIFIC direction used by the expansion. If the other direction has
--- a better canonOrd, the expansion is rejected. We match this by
--- requiring d == dir in isInverseRed.
+-- This eliminates >99% of BFS evaluations that the single-phase
+-- approach (`minimum` on full 5-tuples) would force.
 isCanonical :: Expansion -> Int -> DualGraph -> Bool
 isCanonical (Exp kind _ dir) parentNV g' =
-    case inverseReds of
+    -- Early exit: if inverse has reductionLength > 1 (i.e. L1, B00, or longer)
+    -- but the child has an L0 reduction (x0=1), the inverse can never be
+    -- canonical since L0's x0=1 always beats x0≥2 lexicographically.
+    if reductionLength kind > 1 && hasAnyL0Reduction g'
+    then False
+    else case inverseReds of
         [] -> False
-        _  -> minimum invOrds <= minimum allOrds
+        _  ->
+            let -- Phase 1: cheap (x0,x1,x2,x3) for all reductions
+                invCheaps = map (`cheapCanonOrd` g') inverseReds
+                allCheaps = map (`cheapCanonOrd` g') allReds
+                minAllCheap = minimum allCheaps
+                minInvCheap = minimum invCheaps
+            in if minInvCheap > minAllCheap
+               then False  -- non-inverse reduction strictly better at x0-x3
+               else
+                   -- Phase 2: x4 only for reductions tied at minimum x0-x3
+                   let tiedInv = [ r | (c, r) <- zip invCheaps inverseReds
+                                     , c == minAllCheap ]
+                       tiedAll = [ r | (c, r) <- zip allCheaps allReds
+                                     , c == minAllCheap ]
+                       minInvBFS = minimum (map (`redBFS` g') tiedInv)
+                       minAllBFS = minimum (map (`redBFS` g') tiedAll)
+                   in minInvBFS <= minAllBFS
   where
     -- Only enumerate reductions up to the expansion's length: longer
     -- reductions can never beat the inverse in lexicographic canonOrd
@@ -926,6 +1150,3 @@ isCanonical (Exp kind _ dir) parentNV g' =
     isInverseRed (Red k (a, b) d) =
         k == kind && a `elem` newRange && b `elem` newRange && d == dir
     inverseReds = filter isInverseRed allReds
-
-    invOrds = map (`canonOrd` g') inverseReds
-    allOrds = map (`canonOrd` g') allReds

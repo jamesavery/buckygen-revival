@@ -24,7 +24,6 @@ module Expansion
     ) where
 
 import Seeds (DualGraph(..), EdgeList, initEdgeList, mkDualGraph, mkDualGraphLite)
-import qualified Data.Array as A
 import Data.Array.Unboxed (UArray)
 import qualified Data.Array.Unboxed as UA
 import Data.IntMap.Strict (IntMap)
@@ -82,14 +81,16 @@ nbrAt :: DualGraph -> Vertex -> Int -> Vertex
 nbrAt g u i = adjFlat g UA.! (u * 6 + i)
 {-# INLINE nbrAt #-}
 
--- | Get the neighbor list of vertex u (O(1) via pre-built boxed Array).
+-- | Get the neighbor list of vertex u (reconstructed from flat unboxed array).
+-- INLINE enables foldr/build fusion when used in list comprehension generators.
 nbrs :: DualGraph -> Vertex -> [Vertex]
-nbrs g u = adjArray g A.! u
+nbrs g u = [adjFlat g UA.! (u * 6 + i) | i <- [0 .. degFlat g UA.! u - 1]]
 
 -- | Degree of vertex u (O(1) unboxed lookup).
 deg :: DualGraph -> Vertex -> Int
 deg g u = degFlat g UA.! u
 {-# INLINE deg #-}
+
 
 -- | Find index of v in u's CW neighbor list.
 -- Linear scan over 5-6 contiguous unboxed Ints (faster than IntMap).
@@ -991,8 +992,7 @@ isValidStraightSite g edge dir numEntries =
     let pi = computeStraightPath g edge dir numEntries
         p = mainPath pi
         q = parallelPath pi
-        adj = neighbours g
-        isAdj u v = v `elem` (adj IM.! u)
+        isAdj u v = v `elem` nbrs g u
         pathlength = numEntries - 1
         qLast = last q
         -- path[k] must be adj to par[k-1] and par[k] (for replaceNbrEL)
@@ -1046,8 +1046,7 @@ canBentPath g (u0, v0) dir bentPos bentLen =
         Nothing -> False
         Just (PathInfo path par) ->
             let lastV = last path
-                adj = neighbours g
-                isAdj u v = v `elem` (adj IM.! u)
+                isAdj u v = v `elem` nbrs g u
                 bendI = bentPos + 2
                 -- Check all adjacencies required by applyBent replacements:
                 -- Before bend: path[k] adj par[k-1] and par[k]; par[k] adj path[k+1]

@@ -33,7 +33,7 @@ import System.Environment (getArgs)
 -- neighbor list to flip CW -> CCW.
 toSpiralGraph :: DualGraph -> Spiral.Graph
 toSpiralGraph g =
-    Spiral.mkGraph [ reverse (neighbours g IM.! v)
+    Spiral.mkGraph [ reverse (nbrs g v)
                    | v <- [0 .. numVertices g - 1] ]
 
 -- | Canonical general spiral key for a DualGraph.

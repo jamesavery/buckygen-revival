@@ -3,6 +3,9 @@ module Main where
 import Seeds (DualGraph(..), c20, c28, c30, validateDualGraph)
 import Expansion
 import Canonical
+import Data.Array.Unboxed (UArray)
+import MutGraph (MutGraph, UndoInfo, newMutGraph, loadGraph, freezeGraph,
+                 applyExpansionM, applyRingM, undoMutation)
 import qualified Spiral
 import qualified Data.IntMap.Strict as IM
 import Data.Map.Strict (Map)
@@ -10,8 +13,9 @@ import qualified Data.Map.Strict as Map
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.List (sort, foldl', intercalate, isPrefixOf, partition)
+import Control.Monad (foldM)
+import Control.Monad.ST (ST, runST)
 import System.Environment (getArgs)
-import Data.IORef
 import System.IO (hFlush, stdout)
 
 ---------------------------------------------------------------------
@@ -47,7 +51,7 @@ runTests results = do
 
 toSpiralGraph :: DualGraph -> Spiral.Graph
 toSpiralGraph g =
-    Spiral.mkGraph [ reverse (neighbours g IM.! v)
+    Spiral.mkGraph [ reverse (nbrs g v)
                    | v <- [0 .. numVertices g - 1] ]
 
 generalSpiralKey :: DualGraph -> Maybe Spiral.GeneralSpiral
@@ -72,22 +76,24 @@ bfsTests =
       in Pass $ "BFS direction: DRight /= DLeft: " ++ show (code1 /= code2)
 
     , -- BFS code has correct length: sum(degree-1) + nv separators
-      let BFS code = bfsCanonicalForm c20 0 1 DRight
+      let bfs = bfsCanonicalForm c20 0 1 DRight
           nv = numVertices c20
+          codeLen = bfsCodeLength bfs
           expectedLen = sum [deg c20 v - 1 | v <- [0..nv-1]] + nv
-      in if length code == expectedLen
-         then Pass $ "BFS code length for C20: " ++ show (length code)
+      in if codeLen == expectedLen
+         then Pass $ "BFS code length for C20: " ++ show codeLen
          else Fail "BFS code length" $
-              "expected " ++ show expectedLen ++ ", got " ++ show (length code)
+              "expected " ++ show expectedLen ++ ", got " ++ show codeLen
 
     , -- C28 BFS code length
-      let BFS code = bfsCanonicalForm c28 0 1 DRight
+      let bfs = bfsCanonicalForm c28 0 1 DRight
           nv = numVertices c28
+          codeLen = bfsCodeLength bfs
           expectedLen = sum [deg c28 v - 1 | v <- [0..nv-1]] + nv
-      in if length code == expectedLen
-         then Pass $ "BFS code length for C28: " ++ show (length code)
+      in if codeLen == expectedLen
+         then Pass $ "BFS code length for C28: " ++ show codeLen
          else Fail "BFS code length C28" $
-              "expected " ++ show expectedLen ++ ", got " ++ show (length code)
+              "expected " ++ show expectedLen ++ ", got " ++ show codeLen
     ]
 
 ---------------------------------------------------------------------
@@ -130,7 +136,8 @@ reductionTests =
 data Config = Config
     { cfgMaxDV       :: !Int   -- max dual vertices (= C_n/2 + 2)
     , cfgDebugSpiral :: !Bool  -- compute spiral keys for dedup checking
-    } deriving (Show)
+    , cfgMslTable    :: !(UArray Int Int)  -- precomputed geometric bounds
+    }
 
 ---------------------------------------------------------------------
 -- Per-size statistics
@@ -165,95 +172,105 @@ addSS a b = SS (ssParents a + ssParents b)
 data GenState = GS
     { gsSeen   :: !(Set Spiral.GeneralSpiral)  -- only populated with --spirals
     , gsCounts :: !(Map Int Int)                -- isomer count per dual vertex count
-    , gsGraphs :: !(Map Int [DualGraph])        -- all generated graphs (always populated)
     , gsFailed :: !Int
     , gsStats  :: !(Map Int SizeStats)
     }
 
 emptyState :: GenState
-emptyState = GS Set.empty Map.empty Map.empty 0 Map.empty
+emptyState = GS Set.empty Map.empty 0 Map.empty
 
 addStat :: Int -> SizeStats -> GenState -> GenState
 addStat nv ss st = st { gsStats = Map.insertWith addSS nv ss (gsStats st) }
 
 generate :: Config -> GenState
-generate cfg =
-    -- Compute automorphism groups for seeds
+generate cfg = runST $ do
     let seedsWithAuts = [ (g, canonAuts (canonicalBFSAndGroup g))
                         | g <- [c20, c28, c30] ]
-    in foldl' (\st (g, auts) -> processTree cfg st g auts) emptyState seedsWithAuts
+    mg <- newMutGraph (cfgMaxDV cfg)
+    foldM (\st (seed, auts) -> do
+        loadGraph mg seed
+        processTreeST cfg mg st seed auts
+        ) emptyState seedsWithAuts
 
 -- | Process a graph: record it, then expand its children.
 -- Takes the graph's automorphism group for Rule 2 filtering.
-processTree :: Config -> GenState -> DualGraph -> [Automorphism] -> GenState
-processTree cfg st g auts
-    | numVertices g > cfgMaxDV cfg = st
-    | otherwise =
+processTreeST :: Config -> MutGraph s -> GenState -> DualGraph -> [Automorphism] -> ST s GenState
+processTreeST cfg mg st g auts
+    | numVertices g > cfgMaxDV cfg = return st
+    | otherwise = do
         let nv = numVertices g
-            record s = s { gsCounts = Map.insertWith (+) nv 1 (gsCounts s)
-                         , gsGraphs = Map.insertWith (++) nv [g] (gsGraphs s)
-                         }
-        in if cfgDebugSpiral cfg
+            record s = s { gsCounts = Map.insertWith (+) nv 1 (gsCounts s) }
+        if cfgDebugSpiral cfg
            then case generalSpiralKey g of
                Just gs | Set.member gs (gsSeen st) ->
-                   addStat nv (emptySS { ssDedupCatches = 1 }) st
+                   return $ addStat nv (emptySS { ssDedupCatches = 1 }) st
                Just gs ->
                    let st' = record st { gsSeen = Set.insert gs (gsSeen st) }
-                   in expandChildren cfg st' g auts
+                   in expandChildrenST cfg mg st' g auts
                Nothing ->
-                   st { gsFailed = gsFailed st + 1 }
-           else expandChildren cfg (record st) g auts
+                   return $ st { gsFailed = gsFailed st + 1 }
+           else expandChildrenST cfg mg (record st) g auts
 
 -- | Expand a graph's children using Rule 2 to filter equivalent expansions.
-expandChildren :: Config -> GenState -> DualGraph -> [Automorphism] -> GenState
-expandChildren cfg st g auts =
+-- Uses mutable graph with apply/freeze/test/undo pattern.
+expandChildrenST :: Config -> MutGraph s -> GenState -> DualGraph -> [Automorphism] -> ST s GenState
+expandChildrenST cfg mg st g auts = do
     let maxDV = cfgMaxDV cfg
         nv = numVertices g
-        allReds = allReductions g
+        -- Only need reductions of length ≤ 2 for bounding lemmas.
+        -- allReductions enumerates up to length 5 (expensive bent reductions)
+        -- but maxExpansionLength only ever inspects L0 (length 1) and L1/B00 (length 2).
+        allReds = allReductionsUpTo 2 g
 
         -- Apply bounding lemmas to get maximum expansion length
-        maxLen = maxExpansionLength maxDV g allReds
+        maxLen = maxExpansionLength maxDV (cfgMslTable cfg) g allReds
 
-        -- All expansions within the bound
+        -- All expansions within the bound (pure, uses frozen parent)
         expsAll = expansions maxLen g
         numExpsAll = length expsAll
 
-        -- Rule 2: filter to one per equivalence class
+        -- Rule 2: filter to one per equivalence class (pure)
         expsR2 = filterByRule2 g auts expsAll
         numExpsR2 = length expsR2
 
-        -- Apply canonical test to Rule-2-filtered expansions
-        -- For each child that passes, also compute its automorphism group
-        childrenWithAuts =
-            [ (g', childAuts)
-            | e <- expsR2
-            , let (g', _) = applyExpansion e g
-            , numVertices g' <= maxDV
-            , isCanonical e nv g'
-            , let childAuts = canonAuts (canonicalBFSAndGroup g')
-            ]
-        numCanonPasses = length childrenWithAuts
+    -- Process each expansion with apply/freeze/test/undo
+    (st1, numCanonPasses) <- foldM (\(s, cnt) e -> do
+        let newVerts = numNewVertices (expKind e)
+        if nv + newVerts > maxDV
+            then return (s, cnt)  -- child would exceed target size
+            else do
+                (undo, _) <- applyExpansionM mg e g
+                child <- freezeGraph mg
+                (s', cnt') <- if isCanonical e nv child
+                    then do
+                        let childAuts = canonAuts (canonicalBFSAndGroup child)
+                        s'' <- processTreeST cfg mg s child childAuts
+                        return (s'', cnt + 1)
+                    else return (s, cnt)
+                undoMutation mg undo
+                return (s', cnt')
+        ) (st, 0 :: Int) expsR2
 
-        -- F expansion for (5,0) nanotubes (always canonical)
-        ringChildrenWithAuts = case findNanotubeRing g of
-            Just (ring, outer) | nv + 5 <= maxDV ->
-                let g' = applyRing g ring outer
-                in [(g', canonAuts (canonicalBFSAndGroup g'))]
-            _ -> []
-        numRing = length ringChildrenWithAuts
+    -- F expansion for (5,0) nanotubes (always canonical)
+    (st2, numRing) <- case findNanotubeRing g of
+        Just (ring, outer) | nv + 5 <= maxDV -> do
+            undo <- applyRingM mg ring outer
+            child <- freezeGraph mg
+            let childAuts = canonAuts (canonicalBFSAndGroup child)
+            st' <- processTreeST cfg mg st1 child childAuts
+            undoMutation mg undo
+            return (st', 1 :: Int)
+        _ -> return (st1, 0 :: Int)
 
-        -- Record stats for this parent
-        stats = emptySS { ssParents = 1
+    -- Record stats for this parent
+    let stats = emptySS { ssParents = 1
                         , ssExpansionsAll = numExpsAll
                         , ssExpansionsR2 = numExpsR2
                         , ssCanonPasses = numCanonPasses
                         , ssMaxLen = maxLen
                         , ssRingExps = numRing
                         }
-        st' = addStat nv stats st
-
-    in foldl' (\s (g', childAuts) -> processTree cfg s g' childAuts)
-              st' (childrenWithAuts ++ ringChildrenWithAuts)
+    return $ addStat nv stats st2
 
 ---------------------------------------------------------------------
 -- Known isomer counts
@@ -369,6 +386,8 @@ printStats maxDV st = do
                      ++ " duplicates — Rule 2 filtering incomplete"
         else putStrLn "OK: zero duplicates"
 
+    -- BFS instrumentation removed (was temporary for profiling)
+
 padR :: Int -> String -> String
 padR n s = s ++ replicate (max 0 (n - length s)) ' '
 
@@ -388,7 +407,10 @@ main = do
         maxDV = case positional of
                   (s:_) -> read s
                   []    -> 22  -- C40
-        cfg = Config { cfgMaxDV = maxDV, cfgDebugSpiral = spirals }
+        cfg = Config { cfgMaxDV = maxDV
+                     , cfgDebugSpiral = spirals
+                     , cfgMslTable = buildMaxStraightLengths maxDV
+                     }
 
     putStrLn $ "Mode: " ++ if spirals then "debug (spiral dedup ON)" else "fast (spiral dedup OFF)"
     putStrLn "=== BFS Code Tests ==="

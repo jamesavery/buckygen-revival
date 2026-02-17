@@ -11,8 +11,6 @@ module Seeds
     , validateDualGraph
     ) where
 
-import Data.Array (Array)
-import qualified Data.Array as A
 import Data.Array.Unboxed (UArray)
 import qualified Data.Array.Unboxed as UA
 import Data.IntMap.Strict (IntMap)
@@ -37,7 +35,6 @@ data DualGraph = DG
     , neighbours  :: !(IntMap [Int])   -- IntMap for graph surgery
     , degree5     :: [Int]             -- the 12 degree-5 vertices, sorted
     , edgeList    :: !EdgeList         -- slot tracking for expansion ops
-    , adjArray    :: !(Array Int [Int]) -- boxed: v → [neighbors] (for list-returning nbrs)
     , adjFlat     :: !(UArray Int Int) -- flat unboxed: v*6+i → neighbor (hot-path navigation)
     , degFlat     :: !(UArray Int Int) -- flat unboxed: v → degree
     }
@@ -50,10 +47,9 @@ instance Show DualGraph where
 -- adjFlat: vertex v's i-th CW neighbor at index v*6+i (degree-5 vertices padded with -1).
 -- degFlat: vertex v's degree at index v.
 mkDualGraph :: Int -> IntMap [Int] -> [Int] -> EdgeList -> DualGraph
-mkDualGraph nv adj d5 el = DG nv adj d5 el aa af df
+mkDualGraph nv adj d5 el = DG nv adj d5 el af df
   where
     nbrLists = [adj IM.! v | v <- [0..nv-1]]
-    aa = A.listArray (0, nv-1) nbrLists
     af = UA.listArray (0, nv*6-1) $ concatMap pad nbrLists
     df = UA.listArray (0, nv-1) (map length nbrLists)
     pad ns = take 6 (ns ++ repeat (-1))
@@ -61,10 +57,9 @@ mkDualGraph nv adj d5 el = DG nv adj d5 el aa af df
 -- | Lightweight constructor for reductions (test use only).
 -- Skips EdgeList but still builds Array caches.
 mkDualGraphLite :: Int -> IntMap [Int] -> [Int] -> DualGraph
-mkDualGraphLite nv adj d5 = DG nv adj d5 IM.empty aa af df
+mkDualGraphLite nv adj d5 = DG nv adj d5 IM.empty af df
   where
     nbrLists = [adj IM.! v | v <- [0..nv-1]]
-    aa = A.listArray (0, nv-1) nbrLists
     af = UA.listArray (0, nv*6-1) $ concatMap pad nbrLists
     df = UA.listArray (0, nv-1) (map length nbrLists)
     pad ns = take 6 (ns ++ repeat (-1))

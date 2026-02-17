@@ -21,12 +21,13 @@ library
     Expansion
     Canonical
     Spiral
+    MutGraph
 
 executable buckygen-test
   import:         shared
   hs-source-dirs: src
   main-is:        TestCanonical.hs
-  other-modules:  Seeds, Expansion, Canonical, Spiral
+  other-modules:  Seeds, Expansion, Canonical, Spiral, MutGraph
   ghc-options:    -O2 -rtsopts
 
 executable buckygen-generate

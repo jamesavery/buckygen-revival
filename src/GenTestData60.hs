@@ -22,7 +22,7 @@ import System.IO (hFlush, hPutStr, stdout, stderr, hSetBuffering, BufferMode(..)
 
 toSpiralGraph :: DualGraph -> Spiral.Graph
 toSpiralGraph g =
-    Spiral.mkGraph [ reverse (neighbours g IM.! v)
+    Spiral.mkGraph [ reverse (nbrs g v)
                    | v <- [0 .. numVertices g - 1] ]
 
 -- Generation with general spiral dedup
@@ -67,7 +67,7 @@ formatEntry :: DualGraph -> Spiral.GeneralSpiral -> String
 formatEntry g gs =
     let nv = numVertices g
         cn = (nv - 2) * 2
-        adjLists = [ reverse (neighbours g IM.! v) | v <- [0 .. nv - 1] ]
+        adjLists = [ reverse (nbrs g v) | v <- [0 .. nv - 1] ]
     in "    (" ++ show cn ++ ", "
        ++ show adjLists ++ ", "
        ++ show (Spiral.gsSpiral gs) ++ ", "
