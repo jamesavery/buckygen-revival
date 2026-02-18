@@ -9,16 +9,24 @@ buckygen-revival/
     Seeds.hs             — Seed graphs (C20, C28, C30) + DualGraph type
     Expansion.hs         — Expansion/reduction operations (L, B, F types)
     Canonical.hs         — Canonical test (Rule 1), automorphisms, Rule 2
+    MutGraph.hs          — Mutable graph for in-place DFS (apply/freeze/undo)
+    Search.hs            — **Unified search**: Fold + Schedule + search (sole API)
     Spiral.hs            — Canonical generalized spiral computation
+    DemoForest.hs        — Demo: exercises all schemes, cross-checks at C60
+    BenchPar.hs          — Parallel benchmark (all schedule modes)
+    BenchSearch.hs       — Search benchmark (all 8 backends with timing)
     TestCanonical.hs     — Main test: generation with canonical test + Rule 2
     TestExpansion.hs     — Expansion/reduction unit tests
     Generate.hs          — Brute-force generation with isomorphism dedup
     GenTestData60.hs     — Test data generator (all graphs up to C60)
     TestGraphs60.hs      — Generated test data (5770 graphs with spirals)
+  obsolete/              — Retired modules
+    GenForest.hs         — Old monolithic forest (replaced by Search.hs)
   doc/                   — Algorithm documentation
     C-CODE-ALGORITHM.md  — AUTHORITATIVE: complete algorithm from C code
     BUCKYGEN-MAP.md      — Mapping between paper, C code, and Haskell
     PROGRESS.md          — Current status and bug history
+    FORESTMONAD.md       — Search module: design, usage, benchmarks
     (other .md files)    — Algorithm notes (BFS, spiral, automorphisms, etc.)
 ```
 
@@ -90,8 +98,9 @@ The 6-tuple `(x0, x1, x2, x3, x4, x5)` is evaluated lazily:
 2. **Core types + expansion/reduction operations** — DONE. `src/Expansion.hs`.
 3. **Canonicity test** — DONE. `src/Canonical.hs`. 5-tuple cascade, Rule 2 orbit
    filtering, direction-specific inverse test.
-4. **Forest traversal** — `unfold` with the `SearchMonad` abstraction,
-   strategy-parameterized.
+4. **Forest traversal** — DONE. `src/Search.hs`. Fold + Schedule + search
+   abstraction with 8 backends (DFS, BFS, ParFlat, ParMut, WorkQ, WorkQMut,
+   HierMut, BfsDfs). Zero performance regression vs hardcoded versions.
 5. **Bounding lemmas** — the 5+ lemmas as a `[Bound]` list, trivially extensible.
 6. **Tests against the C implementation** — DONE through C60. All 1812 isomers correct.
 

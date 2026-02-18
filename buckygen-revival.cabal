@@ -25,20 +25,20 @@ library
     Canonical
     Spiral
     MutGraph
-    GenForest
+    Search
 
 executable buckygen-test
   import:         shared
   hs-source-dirs: src
   main-is:        TestCanonical.hs
-  other-modules:  Seeds, Expansion, Canonical, Spiral, MutGraph, GenForest
+  other-modules:  Seeds, Expansion, Canonical, Spiral, MutGraph, Search
   ghc-options:    -O2 -threaded -rtsopts
 
 executable buckygen-par
   import:         shared
   hs-source-dirs: src
   main-is:        BenchPar.hs
-  other-modules:  Seeds, Expansion, Canonical, MutGraph, GenForest
+  other-modules:  Seeds, Expansion, Canonical, MutGraph, Search
   ghc-options:    -O2 -threaded -rtsopts
 
 executable buckygen-generate
@@ -52,7 +52,14 @@ executable buckygen-demo
   import:         shared
   hs-source-dirs: src
   main-is:        DemoForest.hs
-  other-modules:  Seeds, Expansion, Canonical, MutGraph, GenForest
+  other-modules:  Seeds, Expansion, Canonical, MutGraph, Search
+  ghc-options:    -O2 -threaded -rtsopts
+
+executable buckygen-bench-search
+  import:         shared
+  hs-source-dirs: src
+  main-is:        BenchSearch.hs
+  other-modules:  Seeds, Expansion, Canonical, MutGraph, Search
   ghc-options:    -O2 -threaded -rtsopts
 
 executable buckygen-test-expansion

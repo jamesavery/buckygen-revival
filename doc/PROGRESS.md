@@ -1,8 +1,78 @@
 # Progress — Buckygen Rewrite
 
-## Status: C60 generation CORRECT — Parallel evaluation WORKING
+## Status: C60 generation CORRECT — Parallel evaluation WORKING — Search module is sole API
 
-## Latest: 10 traversal schemes + work-queue parallel (2026-02-17)
+## Latest: GenForest retired, Search is the single module (2026-02-18)
+
+### GenForest → Search migration
+- **`GenForest.hs` retired** to `obsolete/GenForest.hs` via `git mv`
+- **`Search.hs` is now self-contained** (~680 lines): absorbs all core definitions
+  (GenConfig, mkConfig, GenTree, genForest, seedsWithAuts, generateChildren,
+  NFData instances, depthProfile, subtreeSizes, allGraphs, graphsOfSize, bfsByLevel)
+  plus the Fold/Schedule/search abstraction and all 8 schedule backends
+- **All consumers rewritten** to import only Search:
+  - `DemoForest.hs` — all 12 items use Search API (was 10 GenForest + 6 Search)
+  - `BenchPar.hs` — all modes use `search countBySize <Schedule> cfg`
+  - `BenchSearch.hs` — pure Search benchmark (removed old/new comparison)
+  - `TestCanonical.hs` — forest cross-check uses `Search.searchPure`
+- **Zero functional changes**: all 6 cross-checks pass at C60 (5770 isomers, 1812 at C60)
+- **Slightly faster** than old GenForest+Search: SeqDFS 59.8s vs 67.4s at C80, 132.5s vs 143.2s at C86
+
+### Benchmark: self-contained Search module (M2 Ultra, GHC 9.6.7 -O2, 10 cores)
+
+**C80 (131,200 isomers)**
+```
+Scheme                              Time        Speedup
+Sequential DFS                      59.8s         1.0x
+Sequential BFS                      59.7s         1.0x
+Parallel Pure (d=9)                  7.2s         8.3x
+Parallel MutGraph (d=9)              5.2s        11.5x
+Work-queue Pure (10w, d=9)           8.5s         7.0x
+Work-queue MutGraph (10w, d=9)       6.6s         9.1x
+Hierarchical MutGraph (d1=4,d2=5)    5.0s        12.0x
+BFS+DFS MutGraph (d=7)               5.8s        10.3x
+```
+
+**C86 (286,272 isomers)**
+```
+Scheme                              Time        Speedup
+Sequential DFS                     132.5s         1.0x
+Sequential BFS                     132.0s         1.0x
+Parallel Pure (d=9)                 16.5s         8.0x
+Parallel MutGraph (d=9)             12.1s        11.0x
+Work-queue Pure (10w, d=9)          17.2s         7.7x
+Work-queue MutGraph (10w, d=9)      12.7s        10.4x
+Hierarchical MutGraph (d1=4,d2=5)   11.4s        11.6x
+BFS+DFS MutGraph (d=7)              13.9s         9.5x
+```
+
+HierMut is fastest at both sizes (12.0x and 11.6x on 10 cores).
+
+### Files changed
+- **Moved**: `src/GenForest.hs` → `obsolete/GenForest.hs`
+- **Rewritten**: `src/Search.hs` (self-contained, ~680 lines)
+- **Rewritten**: `src/DemoForest.hs` (Search-only)
+- **Rewritten**: `src/BenchPar.hs` (Search-only)
+- **Rewritten**: `src/BenchSearch.hs` (Search-only benchmark)
+- **Modified**: `src/TestCanonical.hs` (GenForest → Search)
+- **Modified**: `buckygen-revival.cabal` (removed GenForest from all module lists)
+
+### Previous: Search module created (2026-02-18)
+
+#### SearchMonad abstraction: `Search.hs`
+- **`Fold r`** record: `foldVisit`, `foldMerge`, `foldEmpty` — captures what to collect
+- **`Schedule`** sum type: `SeqDFS | SeqBFS | ParFlat | ParMut | WorkQ | WorkQMut | HierMut | BfsDfs`
+- **`search`**: single entry point dispatching to per-schedule backends
+- **`searchPure`**: pure sequential DFS (no IO)
+- **Predefined folds**: `countBySize`, `collectAll`, `collectOfSize`, `mapNodes`
+- **`SearchM` monad**: `yield` + `searchForest` + `runSearchM` for custom pure DFS
+- **`mutFoldSubtree`**: generalized `mutCountSubtree` parameterized by `Fold r`
+- All 8 schedule backends implemented, all cross-checked against DFS at C60
+- Custom fold (max |Aut| per size) matches `foldForest` result
+- `SearchM` monad produces identical counts
+- Performance regression test at C80 and C86: all results match, zero overhead
+
+## Previous: 10 traversal schemes + work-queue parallel (2026-02-17)
 
 ### Work-queue parallel generation
 - `workQueueCountBySize`: TQueue + forkIO workers + per-worker IORef accumulators
@@ -110,9 +180,10 @@ MutGraph        0.45s       —           6.7s       (1.45x faster)
 - `Expansion.hs` (1354 lines) — Pure graph surgery: 5 expansion types × apply + reduce + enumerate
 - `Canonical.hs` (1206 lines) — 5-tuple canonical test, BFS, automorphisms, Rule 2, bounding lemmas
 - `MutGraph.hs` (551 lines) — Mutable graph for sequential DFS optimization (apply/freeze/undo)
-- `GenForest.hs` (~530 lines) — **Generation forest + 10 traversal schemes**: DFS, BFS, fold, stream, parallel (pure/MutGraph/work-queue), target-size, parallel map
-- `DemoForest.hs` (~145 lines) — Exercises all traversal schemes with cross-checks
-- `BenchPar.hs` (~65 lines) — Parallel benchmark: `pure`, `mut`, `wq`, `analyze` modes
+- `Search.hs` (~680 lines) — **Unified search**: Fold + Schedule + search, generation forest, all 8 backends, SearchM monad, convenience traversals, analysis
+- `DemoForest.hs` (~120 lines) — Exercises all traversal schemes with cross-checks (Search-only)
+- `BenchPar.hs` (~75 lines) — Parallel benchmark: `pure`, `mut`, `wq`, `wqmut`, `hier`, `bfsdfs`, `analyze` modes (Search-only)
+- `BenchSearch.hs` (~100 lines) — Benchmark exercising all 8 schedule backends with timing
 - `Spiral.hs` (297 lines) — Canonical generalized spiral computation
 - `TestCanonical.hs` (555 lines) — Generation tests with MutGraph + pure forest cross-check
 - `TestExpansion.hs` (509 lines) — Expansion round-trip tests

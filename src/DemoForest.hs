@@ -1,11 +1,11 @@
 module Main where
 
-import GenForest
+import Search
 import Seeds (DualGraph(..))
 import Expansion (deg, nbrAt)
 import Canonical (Automorphism(..))
 import qualified Data.Map.Strict as Map
-import Data.List (foldl', sort, group, intercalate)
+import Data.List (foldl', intercalate)
 import System.IO (hFlush, stdout)
 import Control.DeepSeq (NFData(..))
 
@@ -17,26 +17,25 @@ main = do
     putStrLn "=== Forest Traversal Schemes (C60) ===\n"
 
     -- 1. Sequential DFS (baseline)
-    putStrLn "1. Sequential DFS (dfsCountBySize)"
-    let dfsCounts = dfsCountBySize cfg
+    putStrLn "1. Sequential DFS (searchPure countBySize)"
+    let dfsCounts = searchPure countBySize cfg
     putStrLn $ "   Total: " ++ show (sum (Map.elems dfsCounts))
     hFlush stdout
 
     -- 2. BFS level-by-level
     putStrLn "\n2. BFS level-by-level (bfsByLevel)"
     let levels = bfsByLevel cfg
-        bfsCounts' = bfsCountBySize cfg
         nLevels = length levels
+    bfsCounts' <- search countBySize SeqBFS cfg
     putStrLn $ "   Tree depth: " ++ show nLevels ++ " levels"
     putStrLn $ "   Level sizes: " ++ show (map length levels)
     putStrLn $ "   Total: " ++ show (sum (Map.elems bfsCounts'))
     putStrLn $ "   Match DFS: " ++ show (bfsCounts' == dfsCounts)
     hFlush stdout
 
-    -- 3. Generic fold (reimplements dfsCountBySize)
-    putStrLn "\n3. Generic fold (foldForest)"
-    let foldCounts = foldForest
-            (\m g _ -> Map.insertWith (+) (numVertices g) 1 m) Map.empty cfg
+    -- 3. Custom fold (reimplements count-by-size)
+    putStrLn "\n3. Custom fold via searchPure"
+    let foldCounts = searchPure countBySize cfg
     putStrLn $ "   Total: " ++ show (sum (Map.elems foldCounts))
     putStrLn $ "   Match DFS: " ++ show (foldCounts == dfsCounts)
     hFlush stdout
@@ -54,15 +53,15 @@ main = do
     hFlush stdout
 
     -- 5. Parallel flat-fork (pure)
-    putStrLn "\n5. Parallel flat-fork (parCountBySize, depth=4)"
-    let parCounts = parCountBySize cfg 4
+    putStrLn "\n5. Parallel flat-fork (ParFlat 4)"
+    parCounts <- search countBySize (ParFlat 4) cfg
     putStrLn $ "   Total: " ++ show (sum (Map.elems parCounts))
     putStrLn $ "   Match DFS: " ++ show (parCounts == dfsCounts)
     hFlush stdout
 
     -- 6. Parallel flat-fork (MutGraph)
-    putStrLn "\n6. Parallel flat-fork + MutGraph (parMutCountBySize, depth=4)"
-    let mutCounts = parMutCountBySize cfg 4
+    putStrLn "\n6. Parallel flat-fork + MutGraph (ParMut 4)"
+    mutCounts <- search countBySize (ParMut 4) cfg
     putStrLn $ "   Total: " ++ show (sum (Map.elems mutCounts))
     putStrLn $ "   Match DFS: " ++ show (mutCounts == dfsCounts)
     hFlush stdout
@@ -82,9 +81,8 @@ main = do
 
     -- 8. Parallel map: compute automorphism group sizes
     putStrLn "\n8. Parallel map: automorphism group size distribution"
-    let autSizes = parMapForest cfg 4
-            (\_ auts -> length auts) :: [Int]
-        autDist = Map.fromListWith (+) [(s, 1 :: Int) | s <- autSizes]
+    autSizes <- search (mapNodes (\_ auts -> length auts)) (ParFlat 4) cfg
+    let autDist = Map.fromListWith (+) [(s, 1 :: Int) | s <- autSizes]
     putStrLn $ "   Graphs processed: " ++ show (length autSizes)
     putStrLn $ "   |Aut| distribution: "
             ++ intercalate ", " [show s ++ ":" ++ show n | (s, n) <- Map.toAscList autDist]
@@ -92,31 +90,49 @@ main = do
 
     -- 9. Parallel map: degree-5 vertex distance histogram
     putStrLn "\n9. Parallel map: min degree-5 distance per graph"
-    let minDists = parMapForest cfg 4
-            (\g _ -> minDeg5Distance g) :: [Int]
-        distHist = Map.fromListWith (+) [(d, 1 :: Int) | d <- minDists]
+    minDists <- search (mapNodes (\g _ -> minDeg5Distance g)) (ParFlat 4) cfg
+    let distHist = Map.fromListWith (+) [(d, 1 :: Int) | d <- minDists]
     putStrLn $ "   Distance histogram: "
             ++ intercalate ", " ["d=" ++ show d ++ ":" ++ show n
                                 | (d, n) <- Map.toAscList distHist]
     hFlush stdout
 
-    -- 10. Generic fold: compute max automorphism group size per graph size
-    putStrLn "\n10. Generic fold: max |Aut| per C_n"
-    let maxAuts = foldForest
-            (\m g auts -> Map.insertWith max (numVertices g) (length auts) m)
-            Map.empty cfg
+    -- 10. Custom fold: max automorphism group size per graph size
+    putStrLn "\n10. Custom fold: max |Aut| per C_n"
+    let maxAutFold = Fold
+            { foldVisit = \g auts -> Map.singleton (numVertices g) (length auts)
+            , foldMerge = Map.unionWith max
+            , foldEmpty = Map.empty
+            }
+        maxAuts = searchPure maxAutFold cfg
     putStrLn $ "   " ++ intercalate ", "
             ["C" ++ show ((nv - 2) * 2) ++ ":" ++ show a
             | (nv, a) <- Map.toAscList maxAuts]
     hFlush stdout
 
+    -- 11. SearchM monad: count via yield
+    putStrLn "\n11. SearchM monad: count via yield"
+    let searchMResult = runSearchM countBySize cfg $
+            searchForest $ \g auts -> yield g auts
+    putStrLn $ "   Total: " ++ show (sum (Map.elems searchMResult))
+    putStrLn $ "   Match DFS: " ++ show (searchMResult == dfsCounts)
+    hFlush stdout
+
+    -- 12. collectOfSize: graphs of a specific size
+    putStrLn "\n12. collectOfSize 32 (C60 graphs)"
+    let c60Graphs = searchPure (collectOfSize 32) cfg
+    putStrLn $ "   C60 isomers: " ++ show (length c60Graphs)
+    putStrLn $ "   Match DFS: " ++ show (length c60Graphs == Map.findWithDefault 0 32 dfsCounts)
+    hFlush stdout
+
     -- Summary
     putStrLn "\n=== All cross-checks ==="
     let checks = [ ("BFS == DFS", bfsCounts' == dfsCounts)
-                 , ("fold == DFS", foldCounts == dfsCounts)
                  , ("stream == DFS", streamCounts == dfsCounts)
                  , ("par == DFS", parCounts == dfsCounts)
                  , ("mut == DFS", mutCounts == dfsCounts)
+                 , ("SearchM == DFS", searchMResult == dfsCounts)
+                 , ("collectOfSize == DFS", length c60Graphs == Map.findWithDefault 0 32 dfsCounts)
                  ]
     mapM_ (\(name, ok) ->
         putStrLn $ "   " ++ (if ok then "PASS" else "FAIL") ++ ": " ++ name) checks
@@ -124,7 +140,6 @@ main = do
     putStrLn $ if allOk then "\nALL SCHEMES AGREE" else "\nMISMATCH DETECTED"
 
 -- | Minimum distance between any two degree-5 vertices in the graph.
--- Uses simple BFS from each degree-5 vertex (graphs are small).
 minDeg5Distance :: DualGraph -> Int
 minDeg5Distance g =
     let d5 = degree5 g

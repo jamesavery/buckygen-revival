@@ -38,6 +38,8 @@ module GenForest
     , parMapForest
       -- ** Target-size generation
     , graphsOfSize
+      -- ** Subtree collection (for Search module)
+    , collectSubtreeRoots
       -- ** Work-queue (dynamic load balance)
     , workQueueCountBySize
     , wqMutCountBySize

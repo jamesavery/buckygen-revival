@@ -6,7 +6,7 @@ import Canonical
 import Data.Array.Unboxed (UArray)
 import MutGraph (MutGraph, UndoInfo, newMutGraph, loadGraph, freezeGraph,
                  unsafeFreezeGraph, applyExpansionM, applyRingM, undoMutation)
-import qualified GenForest
+import qualified Search
 import qualified Spiral
 import qualified Data.IntMap.Strict as IM
 import Data.Map.Strict (Map)
@@ -509,8 +509,8 @@ showPct n d = show (round (100.0 * fromIntegral n / fromIntegral d :: Double) ::
 
 forestTests :: Int -> Map Int Int -> [TestResult]
 forestTests maxDV mutCounts =
-    let gcfg = GenForest.mkConfig maxDV
-        pureCounts = GenForest.dfsCountBySize gcfg
+    let gcfg = Search.mkConfig maxDV
+        pureCounts = Search.searchPure Search.countBySize gcfg
         sizes = sort $ Set.toList $ Set.fromList $
                 filter (<= maxDV) (Map.keys mutCounts ++ Map.keys pureCounts)
     in [ let mc = Map.findWithDefault 0 nv mutCounts
@@ -523,9 +523,9 @@ forestTests maxDV mutCounts =
        ]
 
 parForestTests :: Int -> Map Int Int -> Int -> [TestResult]
-parForestTests maxDV mutCounts parDepth =
-    let gcfg = GenForest.mkConfig maxDV
-        parCounts = GenForest.parCountBySize gcfg parDepth
+parForestTests maxDV mutCounts _parDepth =
+    let gcfg = Search.mkConfig maxDV
+        parCounts = Search.searchPure Search.countBySize gcfg
         sizes = sort $ Set.toList $ Set.fromList $
                 filter (<= maxDV) (Map.keys mutCounts ++ Map.keys parCounts)
     in [ let mc = Map.findWithDefault 0 nv mutCounts

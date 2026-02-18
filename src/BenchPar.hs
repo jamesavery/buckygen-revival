@@ -1,6 +1,6 @@
 module Main where
 
-import GenForest
+import Search
 import qualified Data.Map.Strict as Map
 import System.Environment (getArgs)
 import System.IO (hFlush, stdout)
@@ -9,8 +9,8 @@ import GHC.Conc (getNumCapabilities)
 -- Usage: buckygen-par <maxDV> <depth> <mode> [arg4]
 --   maxDV:  max dual vertices (default 32 = C60)
 --   depth:  fork depth (default 6). For hier mode: d1,d2 (e.g. "4,5")
---   mode:   pure | mut | wq | wqmut | hier | analyze (default pure)
---   arg4:   nWorkers for wq/wqmut/hier (default = capabilities)
+--   mode:   pure | mut | wq | wqmut | hier | bfsdfs | analyze (default pure)
+--   arg4:   nWorkers for wq/wqmut/hier/bfsdfs (default = capabilities)
 
 main :: IO ()
 main = do
@@ -18,7 +18,7 @@ main = do
     let maxDV = case args of { (s:_) -> read s; [] -> 32 }
         cfg = mkConfig maxDV
         depthStr = case drop 1 args of { (s:_) -> s; [] -> "6" }
-        depth = read depthStr :: Int   -- for non-hier modes
+        depth = read depthStr :: Int
         mode  = case drop 2 args of
                     ("mut":_)     -> "mut"
                     ("pure":_)    -> "pure"
@@ -55,20 +55,20 @@ main = do
             putStrLn $ "  ratio biggest/avg: " ++ show (fromIntegral biggest / avg)
 
         "mut" -> do
-            let counts = parMutCountBySize cfg depth
-                isomers = sum (Map.elems counts)
+            counts <- search countBySize (ParMut depth) cfg
+            let isomers = sum (Map.elems counts)
             putStrLn $ "Total isomers (MutGraph, d=" ++ show depth ++ "): " ++ show isomers
 
         "wq" -> do
             nWorkers <- getWorkerCount args
-            counts <- workQueueCountBySize cfg nWorkers depth
+            counts <- search countBySize (WorkQ nWorkers depth) cfg
             let isomers = sum (Map.elems counts)
             putStrLn $ "Total isomers (wq pure, d=" ++ show depth
                      ++ ", " ++ show nWorkers ++ "w): " ++ show isomers
 
         "wqmut" -> do
             nWorkers <- getWorkerCount args
-            counts <- wqMutCountBySize cfg nWorkers depth
+            counts <- search countBySize (WorkQMut nWorkers depth) cfg
             let isomers = sum (Map.elems counts)
             putStrLn $ "Total isomers (wq MutGraph, d=" ++ show depth
                      ++ ", " ++ show nWorkers ++ "w): " ++ show isomers
@@ -76,7 +76,7 @@ main = do
         "hier" -> do
             nWorkers <- getWorkerCount args
             let (d1, d2) = parseDepthPair depthStr
-            counts <- hierarchicalMutCount cfg nWorkers d1 d2
+            counts <- search countBySize (HierMut nWorkers d1 d2) cfg
             let isomers = sum (Map.elems counts)
             putStrLn $ "Total isomers (hier MutGraph, d1=" ++ show d1
                      ++ " d2=" ++ show d2 ++ ", " ++ show nWorkers ++ "w): "
@@ -84,15 +84,14 @@ main = do
 
         "bfsdfs" -> do
             nWorkers <- getWorkerCount args
-            -- depth = fork depth; BFS workers = DFS workers = nWorkers
-            counts <- parBfsDfsCount cfg nWorkers nWorkers depth
+            counts <- search countBySize (BfsDfs nWorkers nWorkers depth) cfg
             let isomers = sum (Map.elems counts)
             putStrLn $ "Total isomers (BFS+DFS MutGraph, d=" ++ show depth
                      ++ ", " ++ show nWorkers ++ "w): " ++ show isomers
 
         _ -> do
-            let counts = parCountBySize cfg depth
-                isomers = sum (Map.elems counts)
+            counts <- search countBySize (ParFlat depth) cfg
+            let isomers = sum (Map.elems counts)
             putStrLn $ "Total isomers (pure, d=" ++ show depth ++ "): " ++ show isomers
 
 getWorkerCount :: [String] -> IO Int
