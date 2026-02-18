@@ -169,6 +169,30 @@ n/2 + 2 dual vertices. The dual is a triangulation where every vertex has degree
 5 or 6, with exactly 12 degree-5 vertices. Adjacency lists store neighbours in
 cyclic planar order (essential for patch-replacement operations).
 
+## Running benchmarks and tests
+
+**All CLI tools take DUAL VERTEX COUNT, not fullerene vertex count.**
+
+A fullerene C_n has `n/2 + 2` dual vertices. Isomer counts grow as O(n^9), so
+confusing the two results in runs that are orders of magnitude larger than intended.
+
+| Fullerene | Dual vertices | Isomers   |
+|-----------|---------------|-----------|
+| C20       | 12            | 1         |
+| C60       | 32            | 1,812     |
+| C80       | 42            | 31,924    |
+| C100      | 52            | 285,913   |
+| C120      | 62            | 1,674,171 |
+
+Examples:
+```bash
+cabal run buckygen-test -- 32          # test through C60 (32 dual vertices)
+cabal run buckygen-bench-search -- 42 +RTS -N10  # benchmark at C80 (42 dual vertices)
+cabal run buckygen-demo                # cross-checks at C60 (hardcoded to 32 dv)
+```
+
+**Never run parallel benchmarks concurrently** — they compete for cores and skew results.
+
 ## Context Management
 
 After every significant step or decision, update doc/PROGRESS.md with:
