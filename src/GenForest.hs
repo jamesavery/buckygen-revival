@@ -40,6 +40,11 @@ module GenForest
     , graphsOfSize
       -- ** Work-queue (dynamic load balance)
     , workQueueCountBySize
+    , wqMutCountBySize
+      -- ** Hierarchical parallel
+    , hierarchicalMutCount
+      -- ** Parallel BFS + DFS
+    , parBfsDfsCount
       -- * Analysis
     , depthProfile
     , subtreeSizes
@@ -58,11 +63,25 @@ import Data.Ord (Down(..))
 import Control.Monad (foldM, forM_, replicateM)
 import Control.Monad.ST (runST)
 import Control.Parallel.Strategies (using, parList, rdeepseq)
-import Control.DeepSeq (NFData(..))
+import Control.DeepSeq (NFData(..), rwhnf)
 import Control.Concurrent (forkIO, MVar, newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM
-import Control.Exception (SomeException, try)
 import Data.IORef
+import qualified Data.IntMap.Strict as IM
+
+-- NFData instances for parallel evaluation of split results.
+-- All fields are strict/unboxed, so WHNF suffices for the arrays.
+instance NFData DualGraph where
+    rnf (DG nv nbrs d5 el af df) =
+        rnf nv `seq` rnf nbrs `seq` rnf d5 `seq` rnf el `seq`
+        rwhnf af `seq` rwhnf df
+
+instance NFData Automorphism where
+    rnf (Aut p d) = rwhnf p `seq` rnf d
+
+instance NFData Orientation where
+    rnf Preserving = ()
+    rnf Reversing  = ()
 
 ---------------------------------------------------------------------
 -- Configuration
@@ -227,43 +246,46 @@ parCountBySize cfg depth =
 -- allocation.
 parMutCountBySize :: GenConfig -> Int -> Map Int Int
 parMutCountBySize cfg depth =
-    let (topCount, subtrees) = collectSubtreeRoots depth (genForest cfg)
-        subtreeCounts = map mutCountSubtree subtrees `using` parList rdeepseq
-    in mergeAll (topCount : subtreeCounts)
+    let (topCount, subtrees) = collectSubtreeRoots cfg depth (genForest cfg)
+        subtreeCounts = map (mutCountSubtree cfg) subtrees `using` parList rdeepseq
+    in foldl' (Map.unionWith (+)) Map.empty (topCount : subtreeCounts)
+
+-- | Walk the forest to a fork depth, counting nodes above and collecting
+-- (graph, automorphisms) pairs at the fork depth.
+collectSubtreeRoots :: GenConfig -> Int -> [GenTree]
+                    -> (Map Int Int, [(DualGraph, [Automorphism])])
+collectSubtreeRoots cfg d trees = foldl' go (Map.empty, []) trees
+  where
+    maxDV = gcMaxDV cfg
+    go (acc, subs) (GenTree g auts children)
+        | numVertices g > maxDV = (acc, subs)
+        | d <= 0 = (acc, (g, auts) : subs)
+        | otherwise =
+            let acc' = Map.insertWith (+) (numVertices g) 1 acc
+                (childAcc, childSubs) = collectSubtreeRoots cfg (d - 1) children
+            in (Map.unionWith (+) acc' childAcc, subs ++ childSubs)
+
+-- | Count an entire subtree using MutGraph DFS in its own 'runST' block.
+-- Pre-allocates a single 'MutGraph', loads the root graph, then does DFS
+-- with apply/unsafeFreeze/undo. Used by both flat-fork and work-queue
+-- parallel schemes.
+mutCountSubtree :: GenConfig -> (DualGraph, [Automorphism]) -> Map Int Int
+mutCountSubtree cfg (g, auts) = runST $ do
+    mg <- newMutGraph maxDV
+    loadGraph mg g
+    mutDFS mg g auts
   where
     maxDV = gcMaxDV cfg
 
-    mergeAll = foldl' (Map.unionWith (+)) Map.empty
-
-    -- Walk the forest to the fork depth using pure generation,
-    -- collecting (graph, automorphisms) pairs at the fork depth.
-    collectSubtreeRoots :: Int -> [GenTree] -> (Map Int Int, [(DualGraph, [Automorphism])])
-    collectSubtreeRoots d trees = foldl' go (Map.empty, []) trees
-      where
-        go (acc, subs) (GenTree g auts children)
-            | numVertices g > maxDV = (acc, subs)
-            | d <= 0 = (acc, (g, auts) : subs)
-            | otherwise =
-                let acc' = Map.insertWith (+) (numVertices g) 1 acc
-                    (childAcc, childSubs) = collectSubtreeRoots (d - 1) children
-                in (Map.unionWith (+) acc' childAcc, subs ++ childSubs)
-
-    -- Count an entire subtree using MutGraph in its own runST block.
-    mutCountSubtree :: (DualGraph, [Automorphism]) -> Map Int Int
-    mutCountSubtree (g, auts) = runST $ do
-        mg <- newMutGraph maxDV
-        loadGraph mg g
-        mutDFS mg g auts
-
     -- MutGraph-based DFS: apply expansion → unsafeFreeze for canonical test →
     -- safe freeze only for accepted children → recurse → undo.
-    mutDFS mg g auts
-        | numVertices g > maxDV = return Map.empty
+    mutDFS mg g' auts'
+        | numVertices g' > maxDV = return Map.empty
         | otherwise = do
-            let nv = numVertices g
-                allReds = allReductionsUpTo 2 g
-                maxLen = maxExpansionLength maxDV (gcMslTable cfg) g allReds
-                expsR2 = filterByRule2 g auts (expansions maxLen g)
+            let nv = numVertices g'
+                allReds = allReductionsUpTo 2 g'
+                maxLen = maxExpansionLength maxDV (gcMslTable cfg) g' allReds
+                expsR2 = filterByRule2 g' auts' (expansions maxLen g')
 
             -- Process regular expansions
             count1 <- foldM (\acc e -> do
@@ -271,7 +293,7 @@ parMutCountBySize cfg depth =
                 if nv + newVerts > maxDV
                     then return acc
                     else do
-                        (undo, _) <- applyExpansionM mg e g
+                        (undo, _) <- applyExpansionM mg e g'
                         childUnsafe <- unsafeFreezeGraph mg
                         let !verdict = isCanonicalV e nv childUnsafe
                         acc' <- case verdict of
@@ -286,7 +308,7 @@ parMutCountBySize cfg depth =
                 ) (Map.singleton nv 1) expsR2
 
             -- F expansion for (5,0) nanotubes
-            case findNanotubeRing g of
+            case findNanotubeRing g' of
                 Just (ring, outer) | nv + 5 <= maxDV -> do
                     undo <- applyRingM mg ring outer
                     child <- freezeGraph mg
@@ -408,33 +430,21 @@ graphsOfSize cfg target = concatMap go (genForest cfg)
 -- Work-queue (dynamic load balance)
 ---------------------------------------------------------------------
 
--- | Dynamic work-queue parallel generation.
---
--- Separates three concerns:
---   * Generation: pure 'generateChildren' computes subtree roots
---   * Distribution: 'TQueue' — workers pull the next chunk
---   * Consumption: per-worker 'IORef' accumulators, merged at the end
---
--- The tree is split at a fork depth (like flat-fork), but instead of
--- statically assigning subtrees to sparks, the chunks go into a TQueue.
--- Workers pull chunks and DFS each one. When a fast worker finishes,
--- it immediately grabs the next chunk — automatic load balancing.
--- This handles uneven subtree sizes better than parList, where the
--- overall time is dominated by the largest spark.
---
--- Termination: an 'inFlight' counter tracks chunks not yet fully
--- processed. Workers block (STM retry) when queue empty but inFlight > 0.
-workQueueCountBySize :: GenConfig -> Int -> IO (Map Int Int)
-workQueueCountBySize cfg nWorkers = do
-    -- Split the tree at a sensible fork depth
-    let (topCount, subtrees) = collectSubtreeRoots' (genForest cfg)
+-- | Run a work-queue over pre-built chunks.
+-- Shared plumbing for all work-queue variants.
+runWorkQueueOn :: Int
+               -> ((DualGraph, [Automorphism]) -> Map Int Int)
+               -> Map Int Int                              -- counts above the chunks
+               -> [(DualGraph, [Automorphism])]            -- chunks to distribute
+               -> IO (Map Int Int)
+runWorkQueueOn nWorkers countChunk topCount chunks = do
     queue <- newTQueueIO
     inFlight <- newTVarIO (0 :: Int)
 
-    -- Seed the queue with subtree roots
+    -- Seed the queue
     atomically $ do
-        mapM_ (writeTQueue queue) subtrees
-        writeTVar inFlight (length subtrees)
+        mapM_ (writeTQueue queue) chunks
+        writeTVar inFlight (length chunks)
 
     -- Per-worker accumulators
     refs <- replicateM nWorkers (newIORef Map.empty)
@@ -442,39 +452,21 @@ workQueueCountBySize cfg nWorkers = do
 
     -- Launch workers
     forM_ (zip refs dones) $ \(ref, done) ->
-        forkIO (wqWorker cfg queue inFlight ref >> putMVar done ())
+        forkIO (wqWorkerLoop countChunk queue inFlight ref >> putMVar done ())
 
     -- Wait for all workers to finish
     mapM_ takeMVar dones
 
-    -- Merge per-worker results with the top-level counts
+    -- Merge per-worker results with the above-fork counts
     maps <- mapM readIORef refs
     return $! foldl' (Map.unionWith (+)) topCount maps
+
+-- | Worker loop: pull a subtree root from the queue, count it, repeat.
+wqWorkerLoop :: ((DualGraph, [Automorphism]) -> Map Int Int)
+             -> TQueue (DualGraph, [Automorphism])
+             -> TVar Int -> IORef (Map Int Int) -> IO ()
+wqWorkerLoop countChunk queue inFlight countRef = loop
   where
-    maxDV = gcMaxDV cfg
-    forkDepth = max 4 (ceiling (logBase 2 (fromIntegral (nWorkers * 8)) :: Double) :: Int)
-
-    -- Collect (graph, auts) pairs at fork depth, counting nodes above.
-    collectSubtreeRoots' :: [GenTree] -> (Map Int Int, [(DualGraph, [Automorphism])])
-    collectSubtreeRoots' trees = go forkDepth trees
-      where
-        go d ts = foldl' step (Map.empty, []) ts
-          where
-            step (acc, subs) (GenTree g auts children)
-                | numVertices g > maxDV = (acc, subs)
-                | d <= 0 = (acc, (g, auts) : subs)
-                | otherwise =
-                    let acc' = Map.insertWith (+) (numVertices g) 1 acc
-                        (childAcc, childSubs) = go (d - 1) children
-                    in (Map.unionWith (+) acc' childAcc, subs ++ childSubs)
-
--- | Worker loop: pull a subtree root from the queue, DFS it, repeat.
-wqWorker :: GenConfig -> TQueue (DualGraph, [Automorphism])
-         -> TVar Int -> IORef (Map Int Int) -> IO ()
-wqWorker cfg queue inFlight countRef = loop
-  where
-    maxDV = gcMaxDV cfg
-
     loop = do
         mItem <- atomically $ do
             mi <- tryReadTQueue queue
@@ -488,11 +480,27 @@ wqWorker cfg queue inFlight countRef = loop
 
         case mItem of
             Nothing -> return ()
-            Just (g, auts) -> do
-                let !count = localDFS g auts
+            Just chunk -> do
+                let !count = countChunk chunk
                 modifyIORef' countRef (Map.unionWith (+) count)
                 atomically $ modifyTVar' inFlight (subtract 1)
                 loop
+
+-- | Dynamic work-queue with pure DFS backend.
+--
+-- Pre-splits the tree at a fork depth, puts chunks into a 'TQueue'.
+-- Workers pull chunks and DFS each one using pure 'generateChildren'.
+-- A fast worker that finishes a small subtree immediately grabs the
+-- next chunk — automatic load balancing.
+workQueueCountBySize :: GenConfig -> Int -> Int -> IO (Map Int Int)
+workQueueCountBySize cfg nWorkers depth =
+    let (topCount, chunks) = collectSubtreeRoots cfg depth (genForest cfg)
+    in runWorkQueueOn nWorkers pureCount topCount chunks
+  where
+    maxDV = gcMaxDV cfg
+
+    pureCount :: (DualGraph, [Automorphism]) -> Map Int Int
+    pureCount (g, auts) = localDFS g auts
 
     localDFS :: DualGraph -> [Automorphism] -> Map Int Int
     localDFS g auts
@@ -501,6 +509,251 @@ wqWorker cfg queue inFlight countRef = loop
             let children = generateChildren cfg g auts
             in foldl' (\acc (c, ca) -> Map.unionWith (+) acc (localDFS c ca))
                       (Map.singleton (numVertices g) 1) children
+
+-- | Dynamic work-queue with MutGraph DFS backend.
+--
+-- Same work distribution as 'workQueueCountBySize', but each chunk is
+-- processed using a fresh 'MutGraph' with in-place surgery and
+-- unsafeFreeze. Combines the work-queue's dynamic load balancing with
+-- MutGraph's low-allocation inner loop.
+wqMutCountBySize :: GenConfig -> Int -> Int -> IO (Map Int Int)
+wqMutCountBySize cfg nWorkers depth =
+    let (topCount, chunks) = collectSubtreeRoots cfg depth (genForest cfg)
+    in runWorkQueueOn nWorkers (mutCountSubtree cfg) topCount chunks
+
+---------------------------------------------------------------------
+-- Hierarchical parallel (parallel work generation)
+---------------------------------------------------------------------
+
+-- | Hierarchical parallel generation with MutGraph.
+--
+-- Three phases:
+--   1. Sequential split to depth d1 (tiny: ~44 nodes at d1=4).
+--   2. Parallel split: each level-1 subtree is expanded to depth d2
+--      using MutGraph, producing fine-grained chunks. All level-1
+--      subtrees are split simultaneously via parList.
+--   3. Work-queue distributes all chunks to workers for MutGraph DFS.
+--
+-- This avoids the sequential bottleneck of single-level splitting:
+-- the expensive generation work between d1 and d1+d2 is parallelized.
+-- At C400+ the nodes above the fork depth number in the millions;
+-- a single-level split would serialize all that work.
+--
+-- The two depth parameters control the granularity:
+--   d1: sequential bootstrap depth (keep small, e.g. 3-5)
+--   d2: parallel split depth per level-1 subtree
+--   effective total depth ≈ d1 + d2
+hierarchicalMutCount :: GenConfig -> Int -> Int -> Int -> IO (Map Int Int)
+hierarchicalMutCount cfg nWorkers d1 d2 = do
+    -- Phase 1: Sequential split to d1 (fast, few nodes)
+    let (topCount, level1) = collectSubtreeRoots cfg d1 (genForest cfg)
+
+    -- Phase 2: Parallel split each level-1 subtree to d2
+        splitResults = map (mutSplitSubtree cfg d2) level1
+                       `using` parList rdeepseq
+        splitCounts = map fst splitResults
+        allChunks   = concatMap snd splitResults
+        aboveCount  = foldl' (Map.unionWith (+)) topCount splitCounts
+
+    -- Phase 3: Work-queue distributes chunks to workers
+    runWorkQueueOn nWorkers (mutCountSubtree cfg) aboveCount allChunks
+
+-- | Split a subtree to depth d using MutGraph, returning:
+--   (counts of nodes above the split, chunk roots at the split level)
+--
+-- Uses the same apply/freeze/undo pattern as 'mutCountSubtree', but
+-- instead of counting leaf nodes, collects them as work chunks.
+-- Each call gets its own MutGraph in a fresh 'runST' block.
+mutSplitSubtree :: GenConfig -> Int -> (DualGraph, [Automorphism])
+                -> (Map Int Int, [(DualGraph, [Automorphism])])
+mutSplitSubtree cfg depth (g, auts) = runST $ do
+    mg <- newMutGraph maxDV
+    loadGraph mg g
+    go mg depth g auts
+  where
+    maxDV = gcMaxDV cfg
+
+    go mg d g' auts'
+        | numVertices g' > maxDV = return (Map.empty, [])
+        | d <= 0 = return (Map.empty, [(g', auts')])
+        | otherwise = do
+            let nv = numVertices g'
+                allReds = allReductionsUpTo 2 g'
+                maxLen = maxExpansionLength maxDV (gcMslTable cfg) g' allReds
+                expsR2 = filterByRule2 g' auts' (expansions maxLen g')
+
+            -- Process expansions: apply → freeze → recurse → undo
+            (count1, roots1) <- foldM (\(accC, accR) e -> do
+                let newVerts = numNewVertices (expKind e)
+                if nv + newVerts > maxDV
+                    then return (accC, accR)
+                    else do
+                        (undo, _) <- applyExpansionM mg e g'
+                        childUnsafe <- unsafeFreezeGraph mg
+                        let !verdict = isCanonicalV e nv childUnsafe
+                        result <- case verdict of
+                            CanonAccept -> do
+                                child <- freezeGraph mg
+                                let childAuts = canonAuts (canonicalBFSAndGroup child)
+                                go mg (d - 1) child childAuts
+                            _ -> return (Map.empty, [])
+                        undoMutation mg undo
+                        let (cc, cr) = result
+                        return (Map.unionWith (+) accC cc, accR ++ cr)
+                ) (Map.singleton nv 1, []) expsR2
+
+            -- Nanotube ring
+            case findNanotubeRing g' of
+                Just (ring, outer) | nv + 5 <= maxDV -> do
+                    undo <- applyRingM mg ring outer
+                    child <- freezeGraph mg
+                    let childAuts = canonAuts (canonicalBFSAndGroup child)
+                    (cc, cr) <- go mg (d - 1) child childAuts
+                    undoMutation mg undo
+                    return (Map.unionWith (+) count1 cc, roots1 ++ cr)
+                _ -> return (count1, roots1)
+
+---------------------------------------------------------------------
+-- Parallel BFS + DFS (self-generating work queue)
+---------------------------------------------------------------------
+
+-- | Parallel BFS generates work for a parallel DFS.
+--
+-- Two queues, two worker pools:
+--   * BFS queue: items are (graph, auts, depth). BFS workers call
+--     'generateChildren', count the parent, and either re-enqueue
+--     children (depth < forkDepth) or push them onto the DFS queue
+--     (depth >= forkDepth).
+--   * DFS queue: items are (graph, auts). DFS workers pull a subtree
+--     root and count it via 'mutCountSubtree'.
+--
+-- The BFS pool starts with 3 items (seeds) and fills itself
+-- exponentially — no sequential bottleneck. Once all BFS items reach
+-- the fork depth, the BFS queue drains and BFS workers exit. Their
+-- threads are freed for DFS workers.
+--
+-- nBfs: number of BFS worker threads (small, e.g. nWorkers)
+-- nDfs: number of DFS worker threads (can overlap with BFS)
+-- forkDepth: depth at which BFS items become DFS chunks
+parBfsDfsCount :: GenConfig -> Int -> Int -> Int -> IO (Map Int Int)
+parBfsDfsCount cfg nBfs nDfs forkDepth = do
+    -- BFS queue: (graph, auts, current depth)
+    bfsQ <- newTQueueIO
+    bfsInFlight <- newTVarIO (0 :: Int)
+
+    -- DFS queue: (graph, auts) — leaf chunks
+    dfsQ <- newTQueueIO
+    dfsInFlight <- newTVarIO (0 :: Int)
+
+    -- Signal: BFS phase is complete (all BFS workers exited)
+    bfsDone <- newTVarIO False
+
+    -- Seed the BFS queue
+    atomically $ do
+        forM_ seedsWithAuts $ \(g, auts) ->
+            writeTQueue bfsQ (g, auts, 0 :: Int)
+        writeTVar bfsInFlight (length seedsWithAuts)
+
+    -- BFS workers: per-worker count accumulators
+    bfsRefs <- replicateM nBfs (newIORef Map.empty)
+    bfsDones <- replicateM nBfs newEmptyMVar
+    forM_ (zip bfsRefs bfsDones) $ \(ref, done) ->
+        forkIO (bfsWorker cfg forkDepth bfsQ bfsInFlight dfsQ dfsInFlight ref
+                >> putMVar done ())
+
+    -- DFS workers: per-worker count accumulators
+    dfsRefs <- replicateM nDfs (newIORef Map.empty)
+    dfsDones <- replicateM nDfs newEmptyMVar
+    forM_ (zip dfsRefs dfsDones) $ \(ref, done) ->
+        forkIO (dfsWorker cfg dfsQ dfsInFlight bfsDone ref
+                >> putMVar done ())
+
+    -- Wait for BFS to complete, then signal DFS workers
+    mapM_ takeMVar bfsDones
+    atomically $ writeTVar bfsDone True
+
+    -- Wait for DFS to complete
+    mapM_ takeMVar dfsDones
+
+    -- Merge all results
+    bfsMaps <- mapM readIORef bfsRefs
+    dfsMaps <- mapM readIORef dfsRefs
+    return $! foldl' (Map.unionWith (+)) Map.empty (bfsMaps ++ dfsMaps)
+
+-- | BFS worker: generate children, route to BFS or DFS queue.
+bfsWorker :: GenConfig -> Int
+          -> TQueue (DualGraph, [Automorphism], Int)   -- BFS queue
+          -> TVar Int                                   -- BFS inFlight
+          -> TQueue (DualGraph, [Automorphism])         -- DFS queue
+          -> TVar Int                                   -- DFS inFlight
+          -> IORef (Map Int Int)                        -- per-worker counts
+          -> IO ()
+bfsWorker cfg forkDepth bfsQ bfsInFlight dfsQ dfsInFlight countRef = loop
+  where
+    maxDV = gcMaxDV cfg
+
+    loop = do
+        mItem <- atomically $ do
+            mi <- tryReadTQueue bfsQ
+            case mi of
+                Just item -> return (Just item)
+                Nothing -> do
+                    nf <- readTVar bfsInFlight
+                    if nf == 0
+                        then return Nothing
+                        else retry
+
+        case mItem of
+            Nothing -> return ()
+            Just (g, auts, d)
+                | numVertices g > maxDV -> do
+                    atomically $ modifyTVar' bfsInFlight (subtract 1)
+                    loop
+                | otherwise -> do
+                    -- Count this node
+                    modifyIORef' countRef (Map.insertWith (+) (numVertices g) 1)
+                    -- Generate children
+                    let !children = generateChildren cfg g auts
+                    -- Route children
+                    atomically $ do
+                        forM_ children $ \(c, ca) ->
+                            if d + 1 < forkDepth
+                                then do
+                                    writeTQueue bfsQ (c, ca, d + 1)
+                                    modifyTVar' bfsInFlight (+ 1)
+                                else do
+                                    writeTQueue dfsQ (c, ca)
+                                    modifyTVar' dfsInFlight (+ 1)
+                        modifyTVar' bfsInFlight (subtract 1)
+                    loop
+
+-- | DFS worker: pull a chunk and count it with MutGraph.
+-- Waits for either: a DFS item, or BFS completion + empty DFS queue.
+dfsWorker :: GenConfig
+          -> TQueue (DualGraph, [Automorphism])
+          -> TVar Int -> TVar Bool
+          -> IORef (Map Int Int) -> IO ()
+dfsWorker cfg dfsQ dfsInFlight bfsDone countRef = loop
+  where
+    loop = do
+        mItem <- atomically $ do
+            mi <- tryReadTQueue dfsQ
+            case mi of
+                Just item -> return (Just item)
+                Nothing -> do
+                    nf <- readTVar dfsInFlight
+                    done <- readTVar bfsDone
+                    if nf == 0 && done
+                        then return Nothing    -- all work complete
+                        else retry             -- wait for BFS to produce more
+
+        case mItem of
+            Nothing -> return ()
+            Just chunk -> do
+                let !count = mutCountSubtree cfg chunk
+                modifyIORef' countRef (Map.unionWith (+) count)
+                atomically $ modifyTVar' dfsInFlight (subtract 1)
+                loop
 
 ---------------------------------------------------------------------
 -- Analysis

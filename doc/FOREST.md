@@ -295,9 +295,10 @@ parMapForest cfg 4 (\_ auts -> length auts) :: [Int]
 parMapForest cfg 4 (\g _ -> minDeg5Distance g) :: [Int]
 ```
 
-### 9. Work-queue (`workQueueCountBySize`)
+### 9. Work-queue (`workQueueCountBySize`, `wqMutCountBySize`)
 
-An explicit thread pool with dynamic load balancing via STM.
+An explicit thread pool with dynamic load balancing via STM. Two variants:
+pure DFS and MutGraph DFS per chunk.
 
 **Phase 1 --- Split.** Same as flat-fork: walk the tree to a fork depth,
 collect subtree roots. The fork depth is chosen automatically as
@@ -317,11 +318,15 @@ loop:
         if empty, inFlight > 0 -> retry (block until queue changes)
         if empty, inFlight = 0 -> return Nothing (all done)
 
-    DFS the subtree locally (pure generateChildren)
+    count the subtree (pure DFS or MutGraph DFS)
     merge count into per-worker IORef
     atomically: decrement inFlight
     goto loop
 ```
+
+The pure variant (`workQueueCountBySize`) uses `generateChildren` for each
+node. The MutGraph variant (`wqMutCountBySize`) allocates a fresh `MutGraph`
+per chunk via `mutCountSubtree` and uses in-place surgery within.
 
 **Phase 4 --- Merge.** Read all per-worker `IORef` accumulators and union
 them with the top-level counts.
@@ -329,6 +334,18 @@ them with the top-level counts.
 **Termination.** The `inFlight` TVar counts chunks that have been dequeued
 but not yet fully processed. When `inFlight` reaches 0 and the queue is
 empty, every worker's `retry` resolves to `Nothing` and they all exit.
+
+**Implementation.** Both variants share the same plumbing via `runWorkQueue`,
+which takes a chunk-counting function as a parameter:
+
+```haskell
+workQueueCountBySize cfg n = runWorkQueue cfg n (pureCount cfg)
+wqMutCountBySize     cfg n = runWorkQueue cfg n (mutCountSubtree cfg)
+```
+
+The `mutCountSubtree` function is also shared with `parMutCountBySize`
+(scheme 7), so the MutGraph DFS logic is written once and used by both
+flat-fork and work-queue backends.
 
 **Comparison with flat-fork.** Both schemes split the tree at the same
 depth and produce the same chunks. The difference is scheduling:
@@ -342,9 +359,8 @@ depth and produce the same chunks. The difference is scheduling:
 | Purity | Pure (`Map Int Int`) | IO (returns `IO (Map Int Int)`) |
 
 In practice at C80 with 8 cores and ~230 chunks, both give identical
-wall-clock times (~9.5s) because the chunks are numerous enough that
-statistical imbalance is small. The work-queue's advantage would emerge at
-higher core counts or with fewer, more uneven chunks.
+wall-clock times within the same backend. The work-queue's advantage
+would emerge at higher core counts or with fewer, more uneven chunks.
 
 **Design history.** The first implementation enqueued individual graphs
 (not subtree chunks), with workers re-enqueueing children. This had two
@@ -355,7 +371,101 @@ made it 10x slower than flat-fork. The final design pre-splits into chunks
 (eliminating STM from the inner loop) and uses `TQueue` (eliminating the
 deadlock).
 
-### 10. Analysis tools (`depthProfile`, `subtreeSizes`)
+### 10. Hierarchical parallel splitting (`hierarchicalMutCount`)
+
+The flat-fork and work-queue schemes both begin with a sequential walk from
+the roots to the fork depth. At C80 with fork depth 9, this takes ~2,000
+node evaluations --- negligible. But at C400+ the tree has millions of
+internal nodes; a sequential split to depth 20+ would become the bottleneck.
+
+The hierarchical scheme parallelizes the split itself in three phases:
+
+**Phase 1 --- Shallow sequential split.** Walk the tree to a small depth
+*d1* (typically 4), collecting ~44 subtree roots. This is cheap.
+
+**Phase 2 --- Parallel deep split.** Each level-1 subtree is independently
+split to depth *d2* using `mutSplitSubtree`, a MutGraph-based DFS that
+stops at depth *d2* and returns the subtree roots below. All level-1 splits
+run in parallel via `parList rdeepseq`:
+
+```haskell
+let splitResults = map (mutSplitSubtree cfg d2) level1
+                   `using` parList rdeepseq
+    allChunks   = concatMap snd splitResults
+```
+
+**Phase 3 --- Work-queue DFS.** The combined chunks from all level-1
+subtrees are fed into `runWorkQueueOn`, where `nWorkers` threads each
+pull chunks and DFS-count them with `mutCountSubtree`.
+
+```
+      roots
+     / | \
+    /  |  \              d1: sequential (tiny)
+   s1  s2  s3
+  /|\  |  /|\
+ . . . .  . . .          d2: parallel split (one spark per s_i)
+ ||| |||| |||||||
+ c1  c2   c3  ...  cK    chunks: work-queue DFS
+```
+
+The key advantage: the split cost is distributed across capabilities
+instead of serialized. At C80 with d1=4, d2=5, this produces the same
+~2,000 chunks as a flat split to depth 9, but the split itself runs in
+parallel.
+
+### 11. Parallel BFS+DFS (`parBfsDfsCount`)
+
+A self-bootstrapping scheme designed for massive parallelism. Instead of
+pre-computing the fork frontier, work is generated dynamically by a pool
+of BFS workers that feed a pool of DFS workers.
+
+**Architecture.** Two queues:
+
+```
+BFS queue (TQueue):  (graph, auts, depth)
+DFS queue (TQueue):  (graph, auts)
+```
+
+**Phase 1 --- Seed.** Enqueue the 3 root graphs into the BFS queue.
+
+**Phase 2 --- BFS expansion.** `nBFS` worker threads run in parallel.
+Each worker:
+
+1. Dequeues a graph from the BFS queue.
+2. Generates its children (pure `generateChildren` + Rule 2 filter).
+3. For each child:
+   - If `depth < forkDepth`: enqueue to BFS queue (generate more work).
+   - If `depth >= forkDepth`: enqueue to DFS queue (ready for counting).
+4. Counts the parent graph in a per-worker accumulator.
+
+The BFS phase is self-sustaining: it starts with 3 items and quickly
+expands to hundreds as children are re-enqueued. Workers that run out
+of BFS work block on `retry` until new items appear or the BFS phase
+is declared complete.
+
+**Phase 3 --- DFS counting.** `nDFS` worker threads pull subtree roots
+from the DFS queue and count each with `mutCountSubtree`. DFS workers
+run concurrently with BFS workers --- they start consuming chunks as
+soon as the first ones appear at the fork depth.
+
+**Termination.** BFS workers exit when the BFS queue is empty and
+`bfsInFlight` reaches 0. A `bfsDone` TVar is then set to `True`.
+DFS workers exit when the DFS queue is empty, `dfsInFlight` is 0,
+and `bfsDone` is `True`.
+
+```haskell
+parBfsDfsCount :: GenConfig -> Int -> Int -> Int -> IO (Map Int Int)
+-- args: config, nBFS workers, nDFS workers, fork depth
+```
+
+**Comparison with hierarchical.** The BFS+DFS scheme has higher
+per-graph overhead (one STM transaction per BFS-phase graph) but
+eliminates the sequential Phase 1 entirely --- even the initial 3 seeds
+are processed in parallel. For C400+ with millions of BFS-phase nodes,
+this avoids the problem of choosing d1 correctly.
+
+### 12. Analysis tools (`depthProfile`, `subtreeSizes`)
 
 Not traversal schemes per se, but tools for understanding the tree's shape
 to inform the choice of fork depth.
@@ -398,26 +508,65 @@ produce identical isomer counts:
 ALL SCHEMES AGREE
 ```
 
-The work-queue (scheme 9) is validated separately via `BenchPar.hs` since
-it returns `IO`:
+The work-queue and hierarchical variants (schemes 9--11) are validated
+separately via `BenchPar.hs` since they return `IO`:
 
 ```
-Total isomers (work-queue, 8 workers): 5770    -- matches DFS
+Total isomers (work-queue pure, 10 workers): 5770        -- matches DFS
+Total isomers (work-queue MutGraph, 10 workers): 5770    -- matches DFS
+Total isomers (hier MutGraph, d1=4 d2=5, 10w): 5770      -- matches DFS
+Total isomers (BFS+DFS MutGraph, d=7, 10w): 5770         -- matches DFS
 ```
 
 
-## Performance summary (C80, 131,200 isomers, 8 cores)
+## Performance summary
+
+### C80 (131,200 isomers, 10 cores, fork depth 9)
 
 ```
 Scheme                          Wall clock    CPU utilization
 Sequential DFS (1 core)           48s            100%
-Parallel flat-fork, pure          9.5s           612%
-Parallel flat-fork, MutGraph      6.7s           601%
-Work-queue, 8 workers             9.5s           607%
+Flat-fork, pure                   9.5s           670%
+Flat-fork, MutGraph               5.0s           851%
+Work-queue, pure                  9.0s           682%
+Work-queue, MutGraph              6.5s           660%
+Hierarchical MutGraph (d1=4,d2=5) 4.9s           853%
+BFS+DFS MutGraph (d=7)            5.4s           826%
+BFS+DFS MutGraph (d=9)            5.9s           867%
 ```
 
-The MutGraph backend is the fastest because it eliminates allocation in the
-inner loop (in-place surgery + unsafeFreeze). The pure flat-fork and
-work-queue are equivalent because the coordination overhead (sparks vs STM)
-is negligible relative to the per-subtree DFS work. All three parallel
-schemes achieve near-linear scaling from 1 to 8 cores.
+### C86 (286,272 isomers, 10 cores, fork depth 9)
+
+```
+Scheme                          Wall clock    CPU utilization
+Flat-fork, MutGraph              11.4s           827%
+Hierarchical MutGraph (d1=4,d2=5) 11.1s          836%
+BFS+DFS MutGraph (d=7)           12.7s           769%
+BFS+DFS MutGraph (d=9)           13.2s           817%
+```
+
+### Observations
+
+The MutGraph backend is ~1.45x faster than pure at any core count because
+it eliminates allocation in the inner loop (in-place surgery + unsafeFreeze).
+
+The flat-fork and work-queue schedulers are equivalent within each backend
+when chunks are plentiful relative to workers. The work-queue's dynamic
+scheduling advantage would emerge with fewer, more uneven chunks.
+
+The hierarchical scheme matches or slightly beats flat-fork because it
+parallelizes the split phase. At C80--C86 the split is cheap enough that
+the advantage is marginal, but at C400+ the sequential split would dominate.
+
+The BFS+DFS scheme is ~15% slower at C80--C86 due to per-graph STM overhead
+in the BFS phase. However, it is the only scheme that scales without any
+sequential bottleneck: even the initial 3 seeds are processed concurrently,
+making it the best candidate for massive GPU parallelism at C400+.
+
+All parallel schemes achieve near-linear scaling from 1 to 8 cores and
+good utilization at 10 cores. The `mutCountSubtree` function is shared
+across flat-fork, work-queue, hierarchical, and BFS+DFS backends.
+
+The two primary dimensions --- scheduler and backend --- are fully orthogonal.
+Adding a new scheduler means writing a new distribution strategy around the
+same `mutCountSubtree` worker function.

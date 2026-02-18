@@ -1,10 +1,68 @@
 # Progress — Buckygen Rewrite
 
-## Status: C60 generation CORRECT — Algorithm specification COMPLETE
+## Status: C60 generation CORRECT — Parallel evaluation WORKING
 
-## Latest: Selective unsafeFreezeGraph for rejected children (2026-02-17)
+## Latest: 10 traversal schemes + work-queue parallel (2026-02-17)
 
-### Avoid freezeGraph for rejected children
+### Work-queue parallel generation
+- `workQueueCountBySize`: TQueue + forkIO workers + per-worker IORef accumulators
+- Pre-splits tree at fork depth (like flat-fork), puts chunks in TQueue
+- Workers pull chunks and DFS each one — automatic load balancing
+- Matches pure flat-fork performance: C80 N=8: 9.5s (vs 9.6s flat-fork)
+- Initial per-graph STM implementation deadlocked (bounded TBQueue) and was 10x slow;
+  redesigned to pre-split + coarse-grained DFS per chunk
+
+### 10 forest traversal schemes (all cross-checked at C60)
+1. **Sequential DFS** (`dfsCountBySize`) — baseline
+2. **BFS level-by-level** (`bfsByLevel`, `bfsCountBySize`)
+3. **Generic fold** (`foldForest`) — arbitrary accumulator
+4. **Lazy DFS stream** (`allGraphs`) — on-demand [(graph, auts)]
+5. **Parallel flat-fork pure** (`parCountBySize`)
+6. **Parallel flat-fork MutGraph** (`parMutCountBySize`) — fastest
+7. **Target-size generation** (`graphsOfSize`) — pruned for specific C_n
+8. **Parallel map** (`parMapForest`) — apply function to every graph
+9. **Work-queue** (`workQueueCountBySize`) — dynamic load balance
+10. **DemoForest.hs** exercises all schemes and cross-checks: ALL PASS
+
+### Hybrid parallel: pure forest at top, MutGraph DFS within each subtree
+- `parMutCountBySize`: uses pure `generateChildren` to force tree to fork depth,
+  collects subtree roots, spawns independent `runST` blocks with fresh MutGraph
+  per subtree, evaluates via `parList rdeepseq`
+- Combines best of both worlds: pure forest for parallelism (zero shared state),
+  MutGraph for sequential speed within each subtree (in-place surgery + unsafeFreeze)
+- 1.45x faster than pure forest at any core count; 25% less allocation
+
+**Benchmark results — C80 (131,200 isomers), all 3 parallel backends, N=8:**
+```
+Backend                 Elapsed     CPU util
+Pure flat-fork d=6       9.5s        612%
+MutGraph hybrid d=6      6.7s        601%      (fastest)
+Work-queue N=8           9.5s        607%
+```
+
+**Pure forest vs MutGraph hybrid (both N=8 d=6):**
+```
+                C60         C70         C80
+Pure forest     0.55s       —           9.5s
+MutGraph        0.45s       —           6.7s       (1.45x faster)
+```
+
+### Flat-fork parallel strategy
+- `parCountBySize` / `parMutCountBySize` use flat-fork: force tree to fork depth,
+  collect all subtrees into a single flat list, spark each subtree's DFS count
+- Eliminates recursive spark fizzling (229/230 sparks converted vs 83/416 with recursive approach)
+- Optimal fork depth: 6 (230 subtrees) for up to ~10 cores
+- Scaling improves with problem size (more work per subtree → lower overhead ratio)
+- N>8 gives diminishing returns (bottleneck: work imbalance, not GC)
+
+### GenForest: explicit lazy search forest for parallel evaluation
+- Module `GenForest.hs` (~530 lines): decouples tree structure from traversal strategy
+- `generateChildren` — pure function computing all canonical children
+- `genForest` — lazy unfold from 3 seeds
+- 10 traversal schemes (see above)
+- Each subtree is independent — purity guarantees no cross-tree communication
+
+### Selective unsafeFreezeGraph for rejected children
 - 97% of children fail `isCanonical` but previously each paid the O(7n) `freeze` cost
 - Added `unsafeFreezeGraph`: zero-copy alias of MutGraph's mutable arrays as immutable UArrays
 - Safe because `isCanonicalV` returns strict `CanonVerdict` (nullary constructors) — all graph
@@ -48,13 +106,17 @@
 - `buckygen_paper_source/` — original paper (has significant gaps; see BUCKYPAPER.md)
 
 ## Files
-- `Seeds.hs` (920 lines) — Step 1 (complete) + EdgeList type, initEdgeList, 7-field DualGraph (IntMap + Array caches)
-- `Expansion.hs` (~1330 lines) — Core implementation including F (nanotube ring) expansion/reduction
+- `Seeds.hs` (954 lines) — DualGraph type, planar code decoder, 49 seed graphs
+- `Expansion.hs` (1354 lines) — Pure graph surgery: 5 expansion types × apply + reduce + enumerate
+- `Canonical.hs` (1206 lines) — 5-tuple canonical test, BFS, automorphisms, Rule 2, bounding lemmas
+- `MutGraph.hs` (551 lines) — Mutable graph for sequential DFS optimization (apply/freeze/undo)
+- `GenForest.hs` (~530 lines) — **Generation forest + 10 traversal schemes**: DFS, BFS, fold, stream, parallel (pure/MutGraph/work-queue), target-size, parallel map
+- `DemoForest.hs` (~145 lines) — Exercises all traversal schemes with cross-checks
+- `BenchPar.hs` (~65 lines) — Parallel benchmark: `pure`, `mut`, `wq`, `analyze` modes
 - `Spiral.hs` (297 lines) — Canonical generalized spiral computation
-- `Canonical.hs` (~770 lines) — McKay's canonical construction path test + automorphisms + Rule 2
-- `TestCanonical.hs` (~411 lines) — Generation with canonical test + Rule 2 + spiral dedup
-- `TestExpansion.hs` (~509 lines) — Comprehensive tests
-- `Generate.hs` (252 lines) — Generation sanity check with isomorphism deduplication + cross-check
+- `TestCanonical.hs` (555 lines) — Generation tests with MutGraph + pure forest cross-check
+- `TestExpansion.hs` (509 lines) — Expansion round-trip tests
+- `Generate.hs` (252 lines) — Brute-force generation with isomorphism dedup
 - `GenTestData60.hs` (139 lines) — Test data generator (all graphs up to C60)
 - `TestGraphs60.hs` (5790 lines) — Generated test data (5770 graphs with canonical spirals)
 
@@ -283,6 +345,14 @@ C60: 1.45s → 1.35s (7%), C70: 7.73s → 7.06s (9%).
 - Parent-to-child information carrying
 - Remaining gap to C: ~67x
 
-### 4. Forest traversal
+### 4. DONE: Parallel forest traversal
 
-SearchMonad abstraction with parallel strategies.
+Implemented 2026-02-17. Flat-fork `parList rdeepseq` at configurable fork depth.
+C80: 47.9s → 9.7s (4.95x on 8 cores). See parallel benchmark results above.
+
+### 5. Future optimization opportunities
+- Path sharing via `AnnotatedRed` (eliminates 3x redundant path computation for B00)
+- Cross-type priority guards (`hasAnyL1Reduction` for B00 rejection)
+- Parent-to-child information carrying
+- Work-stealing thread pool (for better load balance at high core counts)
+- Remaining gap to C (sequential): ~70x
