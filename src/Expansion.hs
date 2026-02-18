@@ -23,7 +23,7 @@ module Expansion
     , flipDir
     ) where
 
-import Seeds (DualGraph(..), EdgeList, initEdgeList, mkDualGraph, mkDualGraphLite)
+import Seeds (DualGraph(..), mkDualGraph)
 import Data.Array.Unboxed (UArray)
 import qualified Data.Array.Unboxed as UA
 import Data.IntMap.Strict (IntMap)
@@ -201,55 +201,6 @@ prevCW' adj u v =
 sideNbr' :: IntMap [Int] -> Dir -> Vertex -> Vertex -> Vertex
 sideNbr' adj DRight from to = prevCW' adj from to
 sideNbr' adj DLeft  from to = nextCW' adj from to
-
----------------------------------------------------------------------
--- Edge list: slot-based replacement (matching C code's edge_list)
--- EdgeList and initEdgeList are imported from Seeds.
----------------------------------------------------------------------
-
--- | Replace by slot position, not by value search.
--- Looks up the position of orgNbr in vertex's list (via edge_list),
--- replaces whatever is currently at that position with newNbr,
--- and registers newNbr at that position in the edge_list.
-replaceNbrEL :: IntMap [Int] -> EdgeList -> Vertex -> Vertex -> Vertex
-             -> (IntMap [Int], EdgeList)
-replaceNbrEL adj el vertex orgNbr newNbr =
-    let elV = el IM.! vertex
-        pos = case IM.lookup orgNbr elV of
-                Just p  -> p
-                Nothing -> error $ "replaceNbrEL: " ++ show orgNbr
-                    ++ " not in edge_list for vertex " ++ show vertex
-                    ++ " (edge_list keys: " ++ show (IM.keys elV) ++ ")"
-        ns  = adj IM.! vertex
-        ns' = take pos ns ++ [newNbr] ++ drop (pos + 1) ns
-        elV' = IM.insert newNbr pos elV
-    in (IM.insert vertex ns' adj, IM.insert vertex elV' el)
-
--- | Register a new vertex and its neighbors in the edge list.
-registerVertex :: EdgeList -> Vertex -> [Vertex] -> EdgeList
-registerVertex el v ns = IM.insert v (IM.fromList (zip ns [0..])) el
-
--- | Insert 'new' clockwise after 'after' in vertex u's neighbor list,
--- and update the edge list accordingly (shift positions, register new).
--- Uses edge_list for position lookup (slot-based, not value-based).
-insertAfterEL :: IntMap [Int] -> EdgeList -> Vertex -> Vertex -> Vertex
-              -> (IntMap [Int], EdgeList)
-insertAfterEL adj el u after new =
-    let ns = adj IM.! u
-        elU = case IM.lookup u el of
-                Just m  -> m
-                Nothing -> IM.fromList (zip ns [0..])
-        afterPos = case IM.lookup after elU of
-                Just p  -> p
-                Nothing -> error $ "insertAfterEL: " ++ show after
-                               ++ " not in " ++ show u ++ "'s edge_list"
-                               ++ " (keys: " ++ show (IM.keys elU) ++ ")"
-        pos = afterPos + 1  -- insert position (after 'after')
-        ns' = take pos ns ++ [new] ++ drop pos ns
-        elU' = IM.map (\p -> if p >= pos then p + 1 else p) elU
-        elU'' = IM.insert new pos elU'
-    in (IM.insert u ns' adj, IM.insert u elU'' el)
-
 
 ---------------------------------------------------------------------
 -- Path computation
@@ -443,7 +394,7 @@ applyReduction (Exp (B i j) _ _) pi g = reduceBent g pi i (i + j)
 ---------------------------------------------------------------------
 
 applyL0 :: DualGraph -> PathInfo -> Dir -> DualGraph
-applyL0 g (PathInfo path par) dir = mkDualGraph nv' adj' deg5' el'
+applyL0 g (PathInfo path par) dir = mkDualGraph nv' adj' deg5'
   where
     nv = numVertices g
     a  = nv          -- first new vertex (degree-5)
@@ -460,37 +411,32 @@ applyL0 g (PathInfo path par) dir = mkDualGraph nv' adj' deg5' el'
         DRight -> [a, q1, q2, p2, p1]
         DLeft  -> [a, p1, p2, q2, q1]
 
-    -- Start from persistent edge list
     adj0 = neighbours g
-    el_  = edgeList g
 
-    -- Add new vertices and register them
+    -- Add new vertices
     adj1 = IM.insert a aNbrs $ IM.insert b bNbrs adj0
-    el0  = registerVertex (registerVertex el_ a aNbrs) b bNbrs
 
     -- p0: insert a after the appropriate neighbor (becomes degree-6)
-    (adj2, el1) = case dir of
-        DRight -> insertAfterEL adj1 el0 p0 q0 a
-        DLeft  -> insertAfterEL adj1 el0 p0 p1 a
+    adj2 = case dir of
+        DRight -> insertAfter adj1 p0 q0 a
+        DLeft  -> insertAfter adj1 p0 p1 a
 
     -- q2: insert b after the appropriate neighbor (becomes degree-6)
-    (adj3, el2) = case dir of
-        DRight -> insertAfterEL adj2 el1 q2 p2 b
-        DLeft  -> insertAfterEL adj2 el1 q2 (prevCW g q2 p2) b
+    adj3 = case dir of
+        DRight -> insertAfter adj2 q2 p2 b
+        DLeft  -> insertAfter adj2 q2 (prevCW g q2 p2) b
 
     -- p1: replace q0 with a, replace q1 with b
-    (adj4, el3) = let (a1, e1) = replaceNbrEL adj3 el2 p1 q0 a
-                  in  replaceNbrEL a1 e1 p1 q1 b
+    adj4 = replaceNbr (replaceNbr adj3 p1 q0 a) p1 q1 b
 
     -- p2: replace q1 with b
-    (adj5, el4) = replaceNbrEL adj4 el3 p2 q1 b
+    adj5 = replaceNbr adj4 p2 q1 b
 
     -- q0: replace p1 with a
-    (adj6, el5) = replaceNbrEL adj5 el4 q0 p1 a
+    adj6 = replaceNbr adj5 q0 p1 a
 
     -- q1: replace p1 with a, replace p2 with b
-    (adj', el') = let (a1, e1) = replaceNbrEL adj6 el5 q1 p1 a
-                  in  replaceNbrEL a1 e1 q1 p2 b
+    adj' = replaceNbr (replaceNbr adj6 q1 p1 a) q1 p2 b
 
     -- Degree-5 list: remove p0 and q2 (now degree-6), add a and b
     deg5' = sort $ a : b : filter (\v -> v /= p0 && v /= q2) (degree5 g)
@@ -500,7 +446,7 @@ applyL0 g (PathInfo path par) dir = mkDualGraph nv' adj' deg5' el'
 ---------------------------------------------------------------------
 
 reduceL0 :: DualGraph -> PathInfo -> DualGraph
-reduceL0 g (PathInfo path par) = mkDualGraphLite nv' adj' deg5'
+reduceL0 g (PathInfo path par) = mkDualGraph nv' adj' deg5'
   where
     nv = numVertices g
     a  = nv - 2       -- first added vertex
@@ -541,7 +487,7 @@ reduceL0 g (PathInfo path par) = mkDualGraphLite nv' adj' deg5'
 ---------------------------------------------------------------------
 
 applyStraight :: DualGraph -> PathInfo -> Dir -> Int -> DualGraph
-applyStraight g (PathInfo path par) dir pathlength = mkDualGraph nv' adj' deg5' el'
+applyStraight g (PathInfo path par) dir pathlength = mkDualGraph nv' adj' deg5'
   where
     nv  = numVertices g
     nv' = nv + pathlength
@@ -558,39 +504,35 @@ applyStraight g (PathInfo path par) dir pathlength = mkDualGraph nv' adj' deg5' 
             DRight -> [nv+i-1, par!!i, par!!(i+1), nv+i+1, path!!(i+1), path!!i]
             DLeft  -> [nv+i-1, path!!i, path!!(i+1), nv+i+1, par!!(i+1), par!!i]
 
-    -- Start from persistent edge list
     adj0 = neighbours g
-    el_  = edgeList g
 
-    -- Add new vertices and register them
+    -- Add new vertices
     adj1 = foldl' (\acc i -> IM.insert (nv + i) (newVertexNbrs i) acc)
                   adj0 [0..pathlength-1]
-    el0  = foldl' (\acc i -> registerVertex acc (nv+i) (newVertexNbrs i))
-                  el_ [0..pathlength-1]
 
     -- Insert edges at endpoints (degree-5 → degree-6)
-    (adj2, el1) = case dir of
-        DRight -> insertAfterEL adj1 el0 (path!!0) (par!!0) nv
-        DLeft  -> insertAfterEL adj1 el0 (path!!0) (path!!1) nv
-    (adj3, el2) = case dir of
-        DRight -> insertAfterEL adj2 el1 (par!!pathlength) (path!!pathlength) (nv+pathlength-1)
-        DLeft  -> insertAfterEL adj2 el1 (par!!pathlength) (prevCW g (par!!pathlength) (path!!pathlength)) (nv+pathlength-1)
+    adj2 = case dir of
+        DRight -> insertAfter adj1 (path!!0) (par!!0) nv
+        DLeft  -> insertAfter adj1 (path!!0) (path!!1) nv
+    adj3 = case dir of
+        DRight -> insertAfter adj2 (par!!pathlength) (path!!pathlength) (nv+pathlength-1)
+        DLeft  -> insertAfter adj2 (par!!pathlength) (prevCW g (par!!pathlength) (path!!pathlength)) (nv+pathlength-1)
 
     -- Replace neighbors on path vertices
-    (adj4, el3) = foldl' (\(acc, el) i ->
-        let (acc', el') = replaceNbrEL acc el (path!!i) (par!!(i-1)) (nv+i-1)
+    adj4 = foldl' (\acc i ->
+        let acc' = replaceNbr acc (path!!i) (par!!(i-1)) (nv+i-1)
         in if i < pathlength
-           then replaceNbrEL acc' el' (path!!i) (par!!i) (nv+i)
-           else (acc', el'))
-        (adj3, el2) [1..pathlength]
+           then replaceNbr acc' (path!!i) (par!!i) (nv+i)
+           else acc')
+        adj3 [1..pathlength]
 
     -- Replace neighbors on parallel path vertices
-    (adj', el') = foldl' (\(acc, el) i ->
-        let (acc', el') = if i > 0
-                          then replaceNbrEL acc el (par!!i) (path!!i) (nv+i-1)
-                          else (acc, el)
-        in replaceNbrEL acc' el' (par!!i) (path!!(i+1)) (nv+i))
-        (adj4, el3) [0..pathlength-1]
+    adj' = foldl' (\acc i ->
+        let acc' = if i > 0
+                   then replaceNbr acc (par!!i) (path!!i) (nv+i-1)
+                   else acc
+        in replaceNbr acc' (par!!i) (path!!(i+1)) (nv+i))
+        adj4 [0..pathlength-1]
 
     -- Degree-5 list
     deg5' = sort $ (nv) : (nv+pathlength-1) :
@@ -601,7 +543,7 @@ applyStraight g (PathInfo path par) dir pathlength = mkDualGraph nv' adj' deg5' 
 ---------------------------------------------------------------------
 
 reduceStraight :: DualGraph -> PathInfo -> DualGraph
-reduceStraight g (PathInfo path par) = mkDualGraphLite nv' adj' deg5'
+reduceStraight g (PathInfo path par) = mkDualGraph nv' adj' deg5'
   where
     -- Determine pathlength from the path array
     -- path has pathlength+1 entries, par has pathlength+1 entries
@@ -644,7 +586,7 @@ reduceStraight g (PathInfo path par) = mkDualGraphLite nv' adj' deg5'
 ---------------------------------------------------------------------
 
 applyBentZero :: DualGraph -> PathInfo -> Dir -> DualGraph
-applyBentZero g (PathInfo path par) dir = mkDualGraph nv' adj' deg5' el'
+applyBentZero g (PathInfo path par) dir = mkDualGraph nv' adj' deg5'
   where
     nv  = numVertices g
     a   = nv           -- degree-5
@@ -665,39 +607,32 @@ applyBentZero g (PathInfo path par) dir = mkDualGraph nv' adj' deg5' el'
         DRight -> [b, q1, q2, p4, p3]
         DLeft  -> [b, p3, p4, q2, q1]
 
-    -- Start from persistent edge list
     adj0 = neighbours g
-    el_  = edgeList g
 
-    -- Add new vertices and register them
+    -- Add new vertices
     adj1 = IM.insert a aNbrs $ IM.insert b bNbrs $ IM.insert c cNbrs adj0
-    el0  = registerVertex (registerVertex (registerVertex el_ a aNbrs) b bNbrs) c cNbrs
 
     -- Insert edges at endpoints
-    (adj2, el1) = case dir of
-        DRight -> insertAfterEL adj1 el0 p0 q0 a
-        DLeft  -> insertAfterEL adj1 el0 p0 p1 a
-    (adj3, el2) = case dir of
-        DRight -> insertAfterEL adj2 el1 p4 p3 c
-        DLeft  -> insertAfterEL adj2 el1 p4 (prevCW g p4 p3) c
+    adj2 = case dir of
+        DRight -> insertAfter adj1 p0 q0 a
+        DLeft  -> insertAfter adj1 p0 p1 a
+    adj3 = case dir of
+        DRight -> insertAfter adj2 p4 p3 c
+        DLeft  -> insertAfter adj2 p4 (prevCW g p4 p3) c
 
     -- path[1]: replace par[0] → a, par[1] → b
-    (adj4, el3) = let (a1, e1) = replaceNbrEL adj3 el2 p1 q0 a
-                  in  replaceNbrEL a1 e1 p1 q1 b
+    adj4 = replaceNbr (replaceNbr adj3 p1 q0 a) p1 q1 b
     -- path[2]: replace par[1] → b
-    (adj5, el4) = replaceNbrEL adj4 el3 p2 q1 b
+    adj5 = replaceNbr adj4 p2 q1 b
     -- path[3]: replace par[1] → b, par[2] → c
-    (adj6, el5) = let (a1, e1) = replaceNbrEL adj5 el4 p3 q1 b
-                  in  replaceNbrEL a1 e1 p3 q2 c
+    adj6 = replaceNbr (replaceNbr adj5 p3 q1 b) p3 q2 c
 
     -- par[0]: replace path[1] → a
-    (adj7, el6) = replaceNbrEL adj6 el5 q0 p1 a
+    adj7 = replaceNbr adj6 q0 p1 a
     -- par[1]: replace p1 → a, p2 → b, p3 → c
-    (adj8, el7) = let (a1, e1) = replaceNbrEL adj7 el6 q1 p1 a
-                      (a2, e2) = replaceNbrEL a1 e1 q1 p2 b
-                  in  replaceNbrEL a2 e2 q1 p3 c
+    adj8 = replaceNbr (replaceNbr (replaceNbr adj7 q1 p1 a) q1 p2 b) q1 p3 c
     -- par[2]: replace path[3] → c
-    (adj', el') = replaceNbrEL adj8 el7 q2 p3 c
+    adj' = replaceNbr adj8 q2 p3 c
 
     deg5' = sort $ a : c : filter (\v -> v /= p0 && v /= p4) (degree5 g)
 
@@ -706,7 +641,7 @@ applyBentZero g (PathInfo path par) dir = mkDualGraph nv' adj' deg5' el'
 ---------------------------------------------------------------------
 
 reduceBentZero :: DualGraph -> PathInfo -> DualGraph
-reduceBentZero g (PathInfo path par) = mkDualGraphLite nv' adj' deg5'
+reduceBentZero g (PathInfo path par) = mkDualGraph nv' adj' deg5'
   where
     nv  = numVertices g
     a   = nv - 3;  b = nv - 2;  c = nv - 1
@@ -738,158 +673,85 @@ reduceBentZero g (PathInfo path par) = mkDualGraphLite nv' adj' deg5'
 ---------------------------------------------------------------------
 
 applyBent :: DualGraph -> PathInfo -> Dir -> Int -> Int -> DualGraph
-applyBent g (PathInfo path par) dir bentPos bentLen = mkDualGraph nv' adj' deg5' el'
+applyBent g (PathInfo path par) dir bentPos bentLen = mkDualGraph nv' adj' deg5'
   where
     nv  = numVertices g
     numNew = bentLen + 3
     nv' = nv + numNew
 
-    -- Index into new vertices: nv+0 .. nv+numNew-1
-    -- nv+0 and nv+numNew-1 are degree-5, rest degree-6
-
-    -- The bend vertex is at index bentPos+1 in the new vertices.
-    -- Before bend: new vertices 0..bentPos (standard straight pattern)
-    -- Bend vertex: bentPos+1 (connects to 3 path vertices)
-    -- After bend: bentPos+2..numNew-1 (shifted straight pattern)
-
-    -- Build neighbor lists for new vertices.
-    -- Before bend (i=0..bentPos): same as straight
-    -- Bend vertex (i=bentPos+1): 6 neighbors, 3 path vertices
-    -- After bend (i=bentPos+2..numNew-1): shifted pattern
-
-    newVertexNbrs i
-        -- Before the bend
-        | i <= bentPos =
-            let pred = if i > 0 then [nv+i-1] else []
-                succ' = [nv+i+1]
-                core = [path!!i, path!!(i+1)]
-                sides = [par!!(i+1), par!!i]
-            in case dir of
-                DRight -> pred ++ reverse sides ++ succ' ++ reverse core
-                    -- Actually, let me derive this more carefully from the C code.
-                    -- This is getting complex, let me use a different approach.
-                DLeft  -> pred ++ core ++ succ' ++ sides
-
-        -- Bend vertex
-        | i == bentPos + 1 =
-            let pred = [nv+i-1]
-                succ' = [nv+i+1]
-                -- Bend vertex connects to 3 path vertices:
-                -- path[i], path[i+1], path[i+2]
-                -- And 1 parallel vertex: par[i] (= par[bentPos+1])
-                cores = [path!!i, path!!(i+1), path!!(i+2)]
-                side = [par!!i]
-            in case dir of
-                DRight -> pred ++ reverse side ++ succ' ++ reverse cores
-                DLeft  -> pred ++ cores ++ succ' ++ side
-
-        -- After the bend (shifted indices: path[i+1] and path[i+2])
-        | otherwise =
-            let pred = [nv+i-1]
-                succ' = if i < numNew - 1 then [nv+i+1] else []
-                core = [path!!(i+1), path!!(i+2)]
-                sides = [par!!i, par!!(i-1)]
-            in case dir of
-                DRight -> pred ++ reverse sides ++ succ' ++ reverse core
-                DLeft  -> pred ++ core ++ succ' ++ sides
-    -- OK, deriving CW orders from the C code is error-prone with this approach.
-    -- Let me directly implement the C code's wiring pattern instead.
-
     -- Direct implementation following C code extend_bent
-    -- For use_next (DRight), walking via ->prev from firstedge:
-
     newVertexNbrsDirect i
         -- Before the bend (i = 0..bentPos)
         | i <= bentPos && i == 0 = case dir of
-            -- degree-5, no predecessor
-            -- DRight prev traversal: path[0], path[1], nv+1, par[1], par[0]
-            -- CW: [path[0], par[0], par[1], nv+1, path[1]]
             DRight -> [path!!0, par!!0, par!!1, nv+1, path!!1]
-            -- DLeft next traversal: path[0], path[1], nv+1, par[1], par[0]
-            -- CW: same order
             DLeft  -> [path!!0, path!!1, nv+1, par!!1, par!!0]
 
         | i <= bentPos = case dir of
-            -- degree-6, has predecessor and successor
-            -- DRight prev traversal: nv+i-1, path[i], path[i+1], nv+i+1, par[i+1], par[i]
-            -- CW: [nv+i-1, par[i], par[i+1], nv+i+1, path[i+1], path[i]]
             DRight -> [nv+i-1, par!!i, par!!(i+1), nv+i+1, path!!(i+1), path!!i]
             DLeft  -> [nv+i-1, path!!i, path!!(i+1), nv+i+1, par!!(i+1), par!!i]
 
         -- Bend vertex (i = bentPos+1), always degree-6
         | i == bentPos + 1 = case dir of
-            -- DRight prev traversal: nv+i-1, path[i], path[i+1], path[i+2], nv+i+1, par[i]
-            -- CW: [nv+i-1, par[i], nv+i+1, path[i+2], path[i+1], path[i]]
             DRight -> [nv+i-1, par!!i, nv+i+1, path!!(i+2), path!!(i+1), path!!i]
             DLeft  -> [nv+i-1, path!!i, path!!(i+1), path!!(i+2), nv+i+1, par!!i]
 
         -- After the bend (i = bentPos+2..numNew-1)
         | i == numNew - 1 = case dir of
-            -- Last vertex, degree-5, no successor
-            -- DRight prev traversal: nv+i-1, path[i+1], path[i+2], par[i], par[i-1]
-            -- CW: [nv+i-1, par[i-1], par[i], path[i+2], path[i+1]]
             DRight -> [nv+i-1, par!!(i-1), par!!i, path!!(i+2), path!!(i+1)]
             DLeft  -> [nv+i-1, path!!(i+1), path!!(i+2), par!!i, par!!(i-1)]
 
         | otherwise = case dir of
-            -- degree-6, has predecessor and successor
-            -- DRight prev traversal: nv+i-1, path[i+1], path[i+2], nv+i+1, par[i], par[i-1]
-            -- CW: [nv+i-1, par[i-1], par[i], nv+i+1, path[i+2], path[i+1]]
             DRight -> [nv+i-1, par!!(i-1), par!!i, nv+i+1, path!!(i+2), path!!(i+1)]
             DLeft  -> [nv+i-1, path!!(i+1), path!!(i+2), nv+i+1, par!!i, par!!(i-1)]
 
-    -- Start from persistent edge list
     adj0 = neighbours g
-    el_  = edgeList g
 
-    -- Add new vertices and register them
+    -- Add new vertices
     adj1 = foldl' (\acc i -> IM.insert (nv+i) (newVertexNbrsDirect i) acc)
                   adj0 [0..numNew-1]
-    el0  = foldl' (\acc i -> registerVertex acc (nv+i) (newVertexNbrsDirect i))
-                  el_ [0..numNew-1]
 
     -- Insert edges at endpoints
-    (adj2, el1) = case dir of
-        DRight -> insertAfterEL adj1 el0 (path!!0) (par!!0) nv
-        DLeft  -> insertAfterEL adj1 el0 (path!!0) (path!!1) nv
-    (adj3, el2) = case dir of
-        DRight -> insertAfterEL adj2 el1 (path!!(bentLen+4)) (path!!(bentLen+3)) (nv+numNew-1)
-        DLeft  -> insertAfterEL adj2 el1 (path!!(bentLen+4)) (prevCW g (path!!(bentLen+4)) (path!!(bentLen+3))) (nv+numNew-1)
+    adj2 = case dir of
+        DRight -> insertAfter adj1 (path!!0) (par!!0) nv
+        DLeft  -> insertAfter adj1 (path!!0) (path!!1) nv
+    adj3 = case dir of
+        DRight -> insertAfter adj2 (path!!(bentLen+4)) (path!!(bentLen+3)) (nv+numNew-1)
+        DLeft  -> insertAfter adj2 (path!!(bentLen+4)) (prevCW g (path!!(bentLen+4)) (path!!(bentLen+3))) (nv+numNew-1)
 
     -- Replace neighbors: before the bend
-    (adj4, el3) = foldl' (\(acc, el) i ->
-        let (acc', el') = replaceNbrEL acc el (path!!i) (par!!(i-1)) (nv+i-1)
-        in replaceNbrEL acc' el' (path!!i) (par!!i) (nv+i))
-        (adj3, el2) [1..bentPos+1]
+    adj4 = foldl' (\acc i ->
+        let acc' = replaceNbr acc (path!!i) (par!!(i-1)) (nv+i-1)
+        in replaceNbr acc' (path!!i) (par!!i) (nv+i))
+        adj3 [1..bentPos+1]
 
     -- par[i]: replace path[i] → nv+i-1 (for i>0), path[i+1] → nv+i
-    (adj5, el4) = foldl' (\(acc, el) i ->
-        let (acc', el') = if i > 0
-                          then replaceNbrEL acc el (par!!i) (path!!i) (nv+i-1)
-                          else (acc, el)
-        in replaceNbrEL acc' el' (par!!i) (path!!(i+1)) (nv+i))
-        (adj4, el3) [0..bentPos]
+    adj5 = foldl' (\acc i ->
+        let acc' = if i > 0
+                   then replaceNbr acc (par!!i) (path!!i) (nv+i-1)
+                   else acc
+        in replaceNbr acc' (par!!i) (path!!(i+1)) (nv+i))
+        adj4 [0..bentPos]
 
     -- Bend area (i = bentPos + 2 in path indexing)
     bendI = bentPos + 2
-    (adj6, el5) = replaceNbrEL adj5 el4 (path!!bendI) (par!!(bendI-1)) (nv+bendI-1)
-    (adj7, el6) = replaceNbrEL adj6 el5 (par!!(bendI-1)) (path!!(bendI-1)) (nv+bendI-2)
-    (adj8, el7) = replaceNbrEL adj7 el6 (par!!(bendI-1)) (path!!bendI) (nv+bendI-1)
-    (adj9, el8) = replaceNbrEL adj8 el7 (par!!(bendI-1)) (path!!(bendI+1)) (nv+bendI)
+    adj6 = replaceNbr adj5 (path!!bendI) (par!!(bendI-1)) (nv+bendI-1)
+    adj7 = replaceNbr adj6 (par!!(bendI-1)) (path!!(bendI-1)) (nv+bendI-2)
+    adj8 = replaceNbr adj7 (par!!(bendI-1)) (path!!bendI) (nv+bendI-1)
+    adj9 = replaceNbr adj8 (par!!(bendI-1)) (path!!(bendI+1)) (nv+bendI)
 
     -- After the bend: path[i] replace par[i-2] → nv+i-2, par[i-1] → nv+i-1
-    (adj10, el9) = foldl' (\(acc, el) i ->
-        let (acc', el') = replaceNbrEL acc el (path!!i) (par!!(i-2)) (nv+i-2)
-        in replaceNbrEL acc' el' (path!!i) (par!!(i-1)) (nv+i-1))
-        (adj9, el8) [bendI+1..bentLen+3]
+    adj10 = foldl' (\acc i ->
+        let acc' = replaceNbr acc (path!!i) (par!!(i-2)) (nv+i-2)
+        in replaceNbr acc' (path!!i) (par!!(i-1)) (nv+i-1))
+        adj9 [bendI+1..bentLen+3]
 
     -- par[i] (after bend): replace path[i+1] → nv+i, path[i+2] → nv+i+1
-    (adj', el') = foldl' (\(acc, el) i ->
-        let (acc', el') = replaceNbrEL acc el (par!!i) (path!!(i+1)) (nv+i)
+    adj' = foldl' (\acc i ->
+        let acc' = replaceNbr acc (par!!i) (path!!(i+1)) (nv+i)
         in if i < bentLen + 2
-           then replaceNbrEL acc' el' (par!!i) (path!!(i+2)) (nv+i+1)
-           else (acc', el'))
-        (adj10, el9) [bentPos+2..bentLen+2]
+           then replaceNbr acc' (par!!i) (path!!(i+2)) (nv+i+1)
+           else acc')
+        adj10 [bentPos+2..bentLen+2]
 
     deg5' = sort $ nv : (nv+numNew-1) :
         filter (\v -> v /= path!!0 && v /= path!!(bentLen+4)) (degree5 g)
@@ -899,7 +761,7 @@ applyBent g (PathInfo path par) dir bentPos bentLen = mkDualGraph nv' adj' deg5'
 ---------------------------------------------------------------------
 
 reduceBent :: DualGraph -> PathInfo -> Int -> Int -> DualGraph
-reduceBent g (PathInfo path par) bentPos bentLen = mkDualGraphLite nv' adj' deg5'
+reduceBent g (PathInfo path par) bentPos bentLen = mkDualGraph nv' adj' deg5'
   where
     numNew = bentLen + 3
     nv  = numVertices g
@@ -1000,7 +862,7 @@ expansionsL maxLen g =
 
 -- | Check if a straight expansion site is valid: par[last] is degree-5,
 -- path/parallel path are disjoint, and all adjacencies needed by
--- replaceNbrEL hold (essential for non-triangulated graphs).
+-- replaceNbr hold (essential for non-triangulated graphs).
 isValidStraightSite :: DualGraph -> Edge -> Dir -> Int -> Bool
 isValidStraightSite g edge dir numEntries =
     let pi = computeStraightPath g edge dir numEntries
@@ -1008,11 +870,11 @@ isValidStraightSite g edge dir numEntries =
         q = parallelPath pi
         pathlength = numEntries - 1
         qLast = last q
-        -- path[k] must be adj to par[k-1] and par[k] (for replaceNbrEL)
+        -- path[k] must be adj to par[k-1] and par[k] (for replaceNbr)
         pathAdj = all (\k -> isAdj g (p!!k) (q!!(k-1))
                           && isAdj g (p!!k) (q!!k))
                       [1..pathlength]
-        -- par[k] must be adj to path[k+1] (for replaceNbrEL)
+        -- par[k] must be adj to path[k+1] (for replaceNbr)
         parAdj = all (\k -> isAdj g (q!!k) (p!!(k+1))) [0..pathlength-1]
     in deg g qLast == 5
     && null (p `intersect` q)
@@ -1242,7 +1104,7 @@ findNanotubeRing g
 -- outer = [o0, o1, o2, o3, o4] (the cap vertices, where outer[i]
 --         is between ring[i] and ring[(i+1)%5])
 applyRing :: DualGraph -> [Vertex] -> [Vertex] -> DualGraph
-applyRing g ring outer = mkDualGraph nv' adj' deg5' el'
+applyRing g ring outer = mkDualGraph nv' adj' deg5'
   where
     nv  = numVertices g
     nv' = nv + 5
@@ -1251,8 +1113,6 @@ applyRing g ring outer = mkDualGraph nv' adj' deg5' el'
     new i = nv + i
 
     -- CW neighbor list for each new vertex
-    -- nv+i connects to: ring[i], then CW around the vertex:
-    --   new[(i-1+5)%5], outer[i], outer[(i+1)%5], new[(i+1)%5], ring[(i+1)%5]
     newNbrs i = [ ring !! i
                 , new ((i - 1 + 5) `mod` 5)
                 , outer !! i
@@ -1262,29 +1122,23 @@ applyRing g ring outer = mkDualGraph nv' adj' deg5' el'
                 ]
 
     adj0 = neighbours g
-    el_  = edgeList g
 
     -- Add new vertices
     adj1 = foldl' (\acc i -> IM.insert (new i) (newNbrs i) acc) adj0 [0..4]
-    el0  = foldl' (\acc i -> registerVertex acc (new i) (newNbrs i)) el_ [0..4]
 
-    -- Update ring vertices: replace cap-side degree-5 neighbors with new vertices
-    -- ring[i]: replace outer[(i-1+5)%5] with nv+((i-1+5)%5),
-    --          replace outer[i] with nv+i
-    (adj2, el1) = foldl' (\(acc, el) i ->
+    -- Update ring vertices: replace cap-side neighbors with new vertices
+    adj2 = foldl' (\acc i ->
         let prev = (i - 1 + 5) `mod` 5
-            (a1, e1) = replaceNbrEL acc el (ring !! i) (outer !! prev) (new prev)
-        in  replaceNbrEL a1 e1 (ring !! i) (outer !! i) (new i))
-        (adj1, el0) [0..4]
+            acc' = replaceNbr acc (ring !! i) (outer !! prev) (new prev)
+        in  replaceNbr acc' (ring !! i) (outer !! i) (new i))
+        adj1 [0..4]
 
     -- Update outer (cap) vertices: replace ring neighbors with new vertices
-    -- outer[i]: replace ring[i] with nv+((i-1+5)%5),
-    --           replace ring[(i+1)%5] with nv+i
-    (adj', el') = foldl' (\(acc, el) i ->
+    adj' = foldl' (\acc i ->
         let prev = (i - 1 + 5) `mod` 5
-            (a1, e1) = replaceNbrEL acc el (outer !! i) (ring !! i) (new prev)
-        in  replaceNbrEL a1 e1 (outer !! i) (ring !! ((i + 1) `mod` 5)) (new i))
-        (adj2, el1) [0..4]
+            acc' = replaceNbr acc (outer !! i) (ring !! i) (new prev)
+        in  replaceNbr acc' (outer !! i) (ring !! ((i + 1) `mod` 5)) (new i))
+        adj2 [0..4]
 
     -- degree-5 list unchanged (all new vertices are degree 6)
     deg5' = degree5 g
@@ -1300,7 +1154,7 @@ applyRing g ring outer = mkDualGraph nv' adj' deg5' el'
 --                                   ring[(i+1)%5] -> newV[i]
 -- reduceRing undoes these replacements and deletes newV[0..4].
 reduceRing :: DualGraph -> [Vertex] -> [Vertex] -> DualGraph
-reduceRing g ring outer = mkDualGraphLite nv' adj' deg5'
+reduceRing g ring outer = mkDualGraph nv' adj' deg5'
   where
     nv  = numVertices g
     nv' = nv - 5

@@ -2,7 +2,48 @@
 
 ## Status: C60 generation CORRECT — Parallel evaluation WORKING — Search module is sole API
 
-## Latest: GenForest retired, Search is the single module (2026-02-18)
+## Latest: EdgeList removed from DualGraph (2026-02-18)
+
+### EdgeList removal
+- **Removed `EdgeList` type** (`IntMap (IntMap Int)`) from `DualGraph` — it mapped
+  `(vertex, neighbor) → position` in the CW adjacency list, used only during expansion
+  operations. The C code's `edge_list[MAXN][MAXN]` is a flat O(1) 2D array; our IntMap
+  equivalent was O(log n) with pointer chasing — slower than the existing `indexOf`
+  which scans 5-6 contiguous UArray elements.
+- **Seeds.hs**: Removed `EdgeList` type alias, `initEdgeList`, `edgeList` field from
+  `DualGraph` record, merged `mkDualGraph`/`mkDualGraphLite` into single `mkDualGraph`.
+  DualGraph is now 5 fields: `nv`, `neighbours`, `degree5`, `adjFlat`, `degFlat`.
+- **Expansion.hs**: Deleted 3 EL helper functions (`replaceNbrEL`, `registerVertex`,
+  `insertAfterEL`). All 5 apply functions (applyL0, applyStraight, applyBentZero,
+  applyBent, applyRing) now use the existing `replaceNbr`/`insertAfter` helpers.
+  Eliminated all `(adj, el)` tuple threading — just plain `adj` threading.
+  All 4 reduce functions changed from `mkDualGraphLite` to `mkDualGraph`.
+- **MutGraph.hs**: Removed `EdgeList` import, removed extra `IM.empty` from DG constructors.
+- **Generate.hs**: Removed `initEdgeList` import.
+- **Search.hs**: Updated NFData instance (5 fields instead of 6).
+- **All tests pass**: expansion round-trips, canonical generation through C60 (5770 isomers),
+  all 6 demo cross-checks, F expansion tests.
+
+### Benchmark: before/after EdgeList removal (C80, 42 dv, 131,200 isomers, M2 Ultra, 10 cores)
+
+```
+Scheme                        Before    After     Change
+Sequential DFS                 59.8s    52.8s     -12%
+Sequential BFS                 59.7s    52.6s     -12%
+Parallel Pure (d=9)              7.2s     6.4s     -11%
+Parallel MutGraph (d=9)          5.2s     5.2s       0%
+Work-queue Pure (10w, d=9)       8.5s     7.7s      -9%
+Work-queue MutGraph (10w, d=9)   6.6s     6.4s      -3%
+Hierarchical MutGraph (d1=4)     5.0s     5.2s      +4%
+BFS+DFS MutGraph (d=7)           5.8s     6.7s     +16%
+```
+
+Pure backends show a consistent ~11% speedup from removing EdgeList allocation/copy
+overhead on every DualGraph. MutGraph backends are flat (within noise) because they
+bypass `mkDualGraph` for the 97% of candidates that fail canonical testing via
+zero-copy `unsafeFreeze` — they never paid the EdgeList cost.
+
+## GenForest retired, Search is the single module (2026-02-18)
 
 ### GenForest → Search migration
 - **`GenForest.hs` retired** to `obsolete/GenForest.hs` via `git mv`

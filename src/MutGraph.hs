@@ -20,7 +20,7 @@ module MutGraph
     , undoMutation
     ) where
 
-import Seeds (DualGraph(..), EdgeList)
+import Seeds (DualGraph(..))
 import Expansion
 
 import Control.Monad (forM_, forM, foldM)
@@ -91,7 +91,7 @@ freezeGraph mg = do
     d5 <- readSTRef (mgDeg5 mg)
     af <- freeze (mgAdj mg)
     df <- freeze (mgDeg mg)
-    return (DG nv IM.empty d5 IM.empty af df)
+    return (DG nv IM.empty d5 af df)
 {-# INLINE freezeGraph #-}
 
 -- | Zero-copy freeze: aliases the mutable arrays as immutable UArrays.
@@ -110,7 +110,7 @@ unsafeFreezeGraph mg = do
     d5 <- readSTRef (mgDeg5 mg)
     af <- unsafeFreeze (mgAdj mg)
     df <- unsafeFreeze (mgDeg mg)
-    return (DG nv IM.empty d5 IM.empty af df)
+    return (DG nv IM.empty d5 af df)
 {-# INLINE unsafeFreezeGraph #-}
 
 ---------------------------------------------------------------------

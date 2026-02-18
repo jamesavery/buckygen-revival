@@ -11,7 +11,7 @@
 
 module Main where
 
-import Seeds (DualGraph(..), initEdgeList, c20, c28, c30, validateDualGraph)
+import Seeds (DualGraph(..), c20, c28, c30, validateDualGraph)
 import Expansion hiding (intersect)
 import qualified Spiral
 import Data.IntMap.Strict (IntMap)

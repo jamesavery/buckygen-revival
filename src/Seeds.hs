@@ -1,10 +1,7 @@
 {-# LANGUAGE StrictData #-}
 module Seeds
     ( DualGraph(..)
-    , EdgeList
-    , initEdgeList
     , mkDualGraph
-    , mkDualGraphLite
     , decodePlanarCode
     , c20, c28, c30
     , iprSeeds, iprSeedsInvalidBoundary
@@ -18,15 +15,6 @@ import qualified Data.IntMap.Strict as IM
 import Data.List (sort)
 import Data.Word (Word8)
 
--- | Maps (vertex, original_neighbor) -> position in vertex's CW list.
--- Maintained persistently across expansion operations (matching C code's
--- global edge_list array).
-type EdgeList = IntMap (IntMap Int)
-
--- | Initialize edge list from adjacency map: each neighbor maps to its index.
-initEdgeList :: IntMap [Int] -> EdgeList
-initEdgeList = IM.map (\ns -> IM.fromList (zip ns [0..]))
-
 -- | Dual graph of a fullerene (triangulation of the sphere).
 -- Vertices are faces of the primal fullerene; edges connect adjacent faces.
 -- Every vertex has degree 5 or 6; exactly 12 have degree 5.
@@ -34,7 +22,6 @@ data DualGraph = DG
     { numVertices :: !Int
     , neighbours  :: !(IntMap [Int])   -- IntMap for graph surgery
     , degree5     :: [Int]             -- the 12 degree-5 vertices, sorted
-    , edgeList    :: !EdgeList         -- slot tracking for expansion ops
     , adjFlat     :: !(UArray Int Int) -- flat unboxed: v*6+i → neighbor (hot-path navigation)
     , degFlat     :: !(UArray Int Int) -- flat unboxed: v → degree
     }
@@ -46,25 +33,15 @@ instance Show DualGraph where
 -- | Constructor: builds DualGraph with flat unboxed Array caches.
 -- adjFlat: vertex v's i-th CW neighbor at index v*6+i (degree-5 vertices padded with -1).
 -- degFlat: vertex v's degree at index v.
-mkDualGraph :: Int -> IntMap [Int] -> [Int] -> EdgeList -> DualGraph
-mkDualGraph nv adj d5 el = DG nv adj d5 el af df
+mkDualGraph :: Int -> IntMap [Int] -> [Int] -> DualGraph
+mkDualGraph nv adj d5 = DG nv adj d5 af df
   where
     nbrLists = [adj IM.! v | v <- [0..nv-1]]
     af = UA.listArray (0, nv*6-1) $ concatMap pad nbrLists
     df = UA.listArray (0, nv-1) (map length nbrLists)
     pad ns = take 6 (ns ++ repeat (-1))
 
--- | Lightweight constructor for reductions (test use only).
--- Skips EdgeList but still builds Array caches.
-mkDualGraphLite :: Int -> IntMap [Int] -> [Int] -> DualGraph
-mkDualGraphLite nv adj d5 = DG nv adj d5 IM.empty af df
-  where
-    nbrLists = [adj IM.! v | v <- [0..nv-1]]
-    af = UA.listArray (0, nv*6-1) $ concatMap pad nbrLists
-    df = UA.listArray (0, nv-1) (map length nbrLists)
-    pad ns = take 6 (ns ++ repeat (-1))
-
--- | Equality ignores derived fields (edgeList, adjArray, degArray).
+-- | Equality ignores derived fields (adjFlat, degFlat).
 instance Eq DualGraph where
     g1 == g2 = numVertices g1 == numVertices g2
             && neighbours g1 == neighbours g2
@@ -77,7 +54,7 @@ instance Eq DualGraph where
 --   then for each vertex 0..nv-1: 1-indexed neighbours in cyclic order, terminated by 0
 decodePlanarCode :: [Word8] -> DualGraph
 decodePlanarCode [] = error "decodePlanarCode: empty input"
-decodePlanarCode (nvByte : rest) = mkDualGraph nv adj deg5s (initEdgeList adj)
+decodePlanarCode (nvByte : rest) = mkDualGraph nv adj deg5s
   where
     nv = fromIntegral nvByte
     adj = parseVertices 0 rest IM.empty

@@ -75,8 +75,8 @@ import Data.IORef
 ---------------------------------------------------------------------
 
 instance NFData DualGraph where
-    rnf (DG nv nbrs d5 el af df) =
-        rnf nv `seq` rnf nbrs `seq` rnf d5 `seq` rnf el `seq`
+    rnf (DG nv nbrs d5 af df) =
+        rnf nv `seq` rnf nbrs `seq` rnf d5 `seq`
         rwhnf af `seq` rwhnf df
 
 instance NFData Automorphism where
