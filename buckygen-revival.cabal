@@ -62,9 +62,23 @@ executable buckygen-bench-search
   other-modules:  Seeds, Expansion, Canonical, MutGraph, Search
   ghc-options:    -O2 -threaded -rtsopts
 
+executable buckygen-bench-seq
+  import:         shared
+  hs-source-dirs: src
+  main-is:        BenchSeqOnly.hs
+  other-modules:  Seeds, Expansion, Canonical, MutGraph, Search
+  ghc-options:    -O2 -rtsopts
+
 executable buckygen-test-expansion
   import:         shared
   hs-source-dirs: src
   main-is:        TestExpansion.hs
   other-modules:  Seeds, Expansion
+  ghc-options:    -O2 -rtsopts
+
+executable buckygen-diag-prefilter
+  import:         shared
+  hs-source-dirs: src
+  main-is:        DiagPrefilter.hs
+  other-modules:  Seeds, Expansion, Canonical, Spiral, MutGraph, Search
   ghc-options:    -O2 -rtsopts

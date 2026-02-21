@@ -303,50 +303,45 @@ ALL SCHEMES AGREE
 All benchmarks on Apple M2 Ultra (arm64), GHC 9.6.7 -O2, 10 cores
 (`+RTS -N10`), 3 runs per test (median reported).
 
-### C80 (131,200 isomers, 10 cores, fork depth 9)
+### C70 (37 dv, 30,579 isomers, 10 cores, fork depth 9)
 
 ```
 Scheme                              Time        Speedup vs SeqDFS
-Sequential DFS                      59.8s         1.0x
-Sequential BFS                      59.7s         1.0x
-Parallel Pure (d=9)                  7.2s         8.3x
-Parallel MutGraph (d=9)              5.2s        11.5x
-Work-queue Pure (10w, d=9)           8.5s         7.0x
-Work-queue MutGraph (10w, d=9)       6.6s         9.1x
-Hierarchical MutGraph (d1=4,d2=5)    5.0s        12.0x
-BFS+DFS MutGraph (d=7)               5.8s        10.3x
+Sequential DFS                       8.6s         1.0x
+Sequential BFS                       8.4s         1.0x
+Parallel Pure (d=9)                  1.2s         7.2x
+Parallel MutGraph (d=9)              1.2s         7.2x
+Work-queue Pure (10w, d=9)           2.0s         4.3x
+Work-queue MutGraph (10w, d=9)       1.9s         4.5x
+Hierarchical MutGraph (d1=4,d2=5)    950ms        9.1x
+BFS+DFS MutGraph (d=7)               1.1s         7.8x
+```
+
+All results match (30,579 isomers).
+
+### C80 (42 dv, 131,200 isomers, 10 cores, fork depth 9)
+
+```
+Scheme                              Time        Speedup vs SeqDFS
+Sequential DFS                      39.5s         1.0x
+Sequential BFS                      37.7s         1.0x
+Parallel Pure (d=9)                  4.3s         9.2x
+Parallel MutGraph (d=9)              3.9s        10.1x
+Work-queue Pure (10w, d=9)           5.3s         7.5x
+Work-queue MutGraph (10w, d=9)       5.1s         7.7x
+Hierarchical MutGraph (d1=4,d2=5)    3.9s        10.1x
+BFS+DFS MutGraph (d=7)               5.2s         7.6x
 ```
 
 All results match (131,200 isomers).
 
-### C86 (286,272 isomers, 10 cores, fork depth 9)
-
-```
-Scheme                              Time        Speedup vs SeqDFS
-Sequential DFS                     132.5s         1.0x
-Sequential BFS                     132.0s         1.0x
-Parallel Pure (d=9)                 16.5s         8.0x
-Parallel MutGraph (d=9)             12.1s        11.0x
-Work-queue Pure (10w, d=9)          17.2s         7.7x
-Work-queue MutGraph (10w, d=9)      12.7s        10.4x
-Hierarchical MutGraph (d1=4,d2=5)   11.4s        11.6x
-BFS+DFS MutGraph (d=7)              13.9s         9.5x
-```
-
-All results match (286,272 isomers).
-
 ### Analysis
 
-HierMut is the fastest schedule at both sizes, achieving near-linear scaling
-on 10 cores (12.0x at C80, 11.6x at C86).  The three-phase design ---
+HierMut and ParMut are the fastest schedules, achieving near-linear scaling
+on 10 cores (10.1x at C80).  The three-phase design of HierMut ---
 sequential bootstrap, parallel split, work-queue distribution --- eliminates
 both the sequential bottleneck (that limits ParMut at very large sizes) and
 the load imbalance (that limits flat-fork schemes).
-
-MutGraph backends are consistently ~1.4x faster than their pure counterparts
-(ParMut vs ParFlat, WorkQMut vs WorkQ).  The in-place apply/unsafeFreeze/undo
-pattern avoids allocation for the 97% of candidates that fail the canonical
-test.
 
 The `Fold r` parameterization introduces no measurable overhead --- GHC
 specializes the fold record's function fields at compile time, producing the

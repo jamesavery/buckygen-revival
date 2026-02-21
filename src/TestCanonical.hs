@@ -158,6 +158,7 @@ data SizeStats = SS
     , ssRejectPhase1     :: !Int  -- rejected: cheaper reduction found (x0-x3)
     , ssRejectPhase2     :: !Int  -- rejected: BFS tiebreaker lost
     , ssSkippedSize      :: !Int  -- skipped: child would exceed target size
+    , ssLookaheadSkip    :: !Int  -- skipped: length dominance lookahead
     -- BFS automorphism group stats (from canonicalBFSAndGroup)
     , ssCanonBfsCalls    :: !Int  -- number of canonicalBFSAndGroup calls
     , ssBfsEdgesTotal    :: !Int  -- total starting edges (before colour filter)
@@ -168,7 +169,7 @@ data SizeStats = SS
     } deriving (Show)
 
 emptySS :: SizeStats
-emptySS = SS 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+emptySS = SS 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
 
 addSS :: SizeStats -> SizeStats -> SizeStats
 addSS a b = SS (ssParents a + ssParents b)
@@ -183,6 +184,7 @@ addSS a b = SS (ssParents a + ssParents b)
                 (ssRejectPhase1 a + ssRejectPhase1 b)
                 (ssRejectPhase2 a + ssRejectPhase2 b)
                 (ssSkippedSize a + ssSkippedSize b)
+                (ssLookaheadSkip a + ssLookaheadSkip b)
                 (ssCanonBfsCalls a + ssCanonBfsCalls b)
                 (ssBfsEdgesTotal a + ssBfsEdgesTotal b)
                 (ssBfsEdgesFiltered a + ssBfsEdgesFiltered b)
@@ -258,12 +260,17 @@ expandChildrenST cfg mg st g auts = do
         expsR2 = filterByRule2 g auts expsAll
         numExpsR2 = length expsR2
 
+        -- L0 survival sites for length dominance lookahead
+        l0Sites = l0SurvivalSites g
+
     -- Process each expansion with apply/freeze/test/undo.
     -- Accumulate (GenState, SizeStats) to track rejection breakdown.
     (st1, loopSS) <- foldM (\(s, ss) e -> do
         let newVerts = numNewVertices (expKind e)
         if nv + newVerts > maxDV
             then return (s, ss { ssSkippedSize = ssSkippedSize ss + 1 })
+            else if lengthDominanceSkip l0Sites g e
+            then return (s, ss { ssLookaheadSkip = ssLookaheadSkip ss + 1 })
             else do
                 (undo, _) <- applyExpansionM mg e g
                 -- Zero-copy freeze for canonical test (97% reject, no copy needed).
@@ -449,6 +456,7 @@ printStats maxDV st = do
     let tested = canonPasses + ssRejectL0Early totals + ssRejectNoInverse totals
                  + ssRejectPhase1 totals + ssRejectPhase2 totals
         skipped = ssSkippedSize totals
+        lookahead = ssLookaheadSkip totals
     putStrLn ""
     putStrLn "=== Canonical Test Breakdown ==="
     putStrLn $ "  isCanonical calls:         " ++ padL 10 (show tested)
@@ -463,6 +471,7 @@ printStats maxDV st = do
     putStrLn $ "    Reject phase 2 (BFS):    " ++ padL 10 (show (ssRejectPhase2 totals))
             ++ "  (" ++ showPct (ssRejectPhase2 totals) tested ++ "%)"
     putStrLn $ "    Skipped (size limit):    " ++ padL 10 (show skipped)
+    putStrLn $ "    Lookahead skip (L0 dom): " ++ padL 10 (show lookahead)
 
     -- BFS automorphism group stats
     let bfsCalls = ssCanonBfsCalls totals

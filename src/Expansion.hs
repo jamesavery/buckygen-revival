@@ -21,6 +21,9 @@ module Expansion
     , reductionLength, longestStraight, numNewVertices
       -- * Direction
     , flipDir
+      -- * Length dominance lookahead
+    , expansionFootprint
+    , lengthDominanceSkip
     ) where
 
 import Seeds (DualGraph(..), mkDualGraph)
@@ -1182,6 +1185,39 @@ reduceRing g ring outer = mkDualGraph nv' adj' deg5'
 
     -- degree-5 list unchanged (removed vertices were all degree 6)
     deg5' = degree5 g
+
+---------------------------------------------------------------------
+-- Length dominance lookahead
+---------------------------------------------------------------------
+
+-- | Compute the set of vertices modified by an expansion (its "footprint"),
+-- without actually applying it. This is the union of the main path and
+-- parallel path vertices from the expansion's PathInfo.
+expansionFootprint :: DualGraph -> Expansion -> IS.IntSet
+expansionFootprint g (Exp (L i) edge dir) =
+    let pi' = computeStraightPath g edge dir (i + 3)
+    in IS.fromList (mainPath pi' ++ parallelPath pi')
+expansionFootprint g (Exp (B 0 0) edge dir) =
+    let pi' = computeBentZeroPath g edge dir
+    in IS.fromList (mainPath pi' ++ parallelPath pi')
+expansionFootprint g (Exp (B i j) edge dir) =
+    let pi' = computeBentPath g edge dir i (i + j)
+    in IS.fromList (mainPath pi' ++ parallelPath pi')
+expansionFootprint _ (Exp F _ _) = IS.empty
+
+-- | Check if an expansion should be skipped due to length dominance.
+-- Returns True if a parent L0 reduction survives into the child (both
+-- vertices outside the expansion footprint), meaning the child will have
+-- an L0 reduction that lexicographically dominates the expansion's inverse.
+--
+-- The l0Sites argument should be computed once per parent via l0SurvivalSites.
+lengthDominanceSkip :: [(Vertex, Vertex)] -> DualGraph -> Expansion -> Bool
+lengthDominanceSkip l0Sites g e
+    | reductionLength (expKind e) <= 1 = False   -- L0 can't be dominated
+    | null l0Sites = False                        -- no L0 reductions in parent
+    | otherwise =
+        let fp = expansionFootprint g e
+        in any (\(u, v) -> not (IS.member u fp) && not (IS.member v fp)) l0Sites
 
 ---------------------------------------------------------------------
 -- Reduction helpers

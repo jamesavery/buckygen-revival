@@ -44,16 +44,18 @@ import Seeds (DualGraph(..), c20, c28, c30)
 import Expansion
     ( Expansion(..), findNanotubeRing, numNewVertices, expansions
     , applyExpansion, applyRing
+    , lengthDominanceSkip
     )
 import Canonical
-    ( Automorphism(..), Orientation(..), CanonVerdict(..), isCanonicalV
-    , isCanonical
+    ( Automorphism(..), Orientation(..), CanonVerdict(..)
+    , isCanonicalWithGroup
     , allReductionsUpTo, maxExpansionLength, filterByRule2
     , canonicalBFSAndGroup, canonAuts
     , buildMaxStraightLengths
+    , l0SurvivalSites
     )
 import MutGraph
-    ( newMutGraph, loadGraph, freezeGraph, unsafeFreezeGraph
+    ( newMutGraph, loadGraph, freezeGraph
     , applyExpansionM, applyRingM, undoMutation
     )
 
@@ -139,13 +141,18 @@ generateChildren cfg g auts = regular ++ ring
     -- Expansion sites: enumerate, then filter by Rule 2
     expsR2 = filterByRule2 g auts (expansions maxLen g)
 
+    -- L0 survival sites for length dominance lookahead
+    l0Sites = l0SurvivalSites g
+
     -- Apply each expansion, keep those that pass the canonical test
     regular =
-        [ (child, canonAuts (canonicalBFSAndGroup child))
+        [ (child, childAuts)
         | e <- expsR2
         , nv + numNewVertices (expKind e) <= maxDV
+        , not (lengthDominanceSkip l0Sites g e)
         , let (child, _) = applyExpansion e g
-        , isCanonical e nv child
+        , let (verdict, childAuts) = isCanonicalWithGroup e nv child
+        , verdict == CanonAccept
         ]
 
     -- Nanotube ring expansion (always canonical, only for (5,0) nanotubes)
@@ -383,6 +390,7 @@ mutFoldSubtree fold cfg (g, auts) = runST $ do
                 allReds = allReductionsUpTo 2 g'
                 maxLen = maxExpansionLength maxDV (gcMslTable cfg) g' allReds
                 expsR2 = filterByRule2 g' auts' (expansions maxLen g')
+                l0Sites = l0SurvivalSites g'
                 here = foldVisit fold g' auts'
 
             -- Process regular expansions
@@ -390,14 +398,14 @@ mutFoldSubtree fold cfg (g, auts) = runST $ do
                 let newVerts = numNewVertices (expKind e)
                 if nv + newVerts > maxDV
                     then return acc
+                    else if lengthDominanceSkip l0Sites g' e
+                    then return acc
                     else do
                         (undo, _) <- applyExpansionM mg e g'
-                        childUnsafe <- unsafeFreezeGraph mg
-                        let !verdict = isCanonicalV e nv childUnsafe
+                        child <- freezeGraph mg
+                        let !(verdict, childAuts) = isCanonicalWithGroup e nv child
                         acc' <- case verdict of
                             CanonAccept -> do
-                                child <- freezeGraph mg
-                                let childAuts = canonAuts (canonicalBFSAndGroup child)
                                 result <- mutDFS mg child childAuts
                                 return (foldMerge fold acc result)
                             _ -> return acc
@@ -492,6 +500,7 @@ mutSplitFoldSubtree fold cfg depth (g, auts) = runST $ do
                 allReds = allReductionsUpTo 2 g'
                 maxLen = maxExpansionLength maxDV (gcMslTable cfg) g' allReds
                 expsR2 = filterByRule2 g' auts' (expansions maxLen g')
+                l0Sites = l0SurvivalSites g'
                 here = foldVisit fold g' auts'
 
             -- Process expansions
@@ -499,15 +508,14 @@ mutSplitFoldSubtree fold cfg depth (g, auts) = runST $ do
                 let newVerts = numNewVertices (expKind e)
                 if nv + newVerts > maxDV
                     then return (accR, accRoots)
+                    else if lengthDominanceSkip l0Sites g' e
+                    then return (accR, accRoots)
                     else do
                         (undo, _) <- applyExpansionM mg e g'
-                        childUnsafe <- unsafeFreezeGraph mg
-                        let !verdict = isCanonicalV e nv childUnsafe
+                        child <- freezeGraph mg
+                        let !(verdict, childAuts) = isCanonicalWithGroup e nv child
                         result <- case verdict of
-                            CanonAccept -> do
-                                child <- freezeGraph mg
-                                let childAuts = canonAuts (canonicalBFSAndGroup child)
-                                go mg (d - 1) child childAuts
+                            CanonAccept -> go mg (d - 1) child childAuts
                             _ -> return (foldEmpty fold, [])
                         undoMutation mg undo
                         let (cr, croots) = result

@@ -36,9 +36,13 @@ module Canonical
     , buildMaxStraightLengths
     , maxExpansionLength
     , reductionFiveVertices
+      -- * L0 survival sites (for length dominance lookahead)
+    , l0SurvivalSites
       -- * Instrumented canonicity test
     , CanonVerdict(..)
     , isCanonicalV
+      -- * Integrated canonical test + automorphism group
+    , isCanonicalWithGroup
     ) where
 
 import Seeds (DualGraph(..))
@@ -879,6 +883,21 @@ isValidL0Direction g (u, v) DLeft =
     deg g (advanceCW g u v (deg g u - 2)) == 6 &&
     deg g (advanceCW g v u (deg g v - 2)) == 6
 
+-- | Enumerate all valid L0 edges as undirected (u, v) pairs with u < v.
+-- Used by the length dominance lookahead to detect L0 reductions that
+-- survive into a child graph without actually applying the expansion.
+l0SurvivalSites :: DualGraph -> [(Vertex, Vertex)]
+l0SurvivalSites g =
+    [ (u, v)
+    | u <- degree5 g
+    , i <- [0 .. deg g u - 1]
+    , let v = nbrAt g u i
+    , v > u
+    , deg g v == 5
+    , isValidL0Direction g (u, v) DLeft
+      || isValidL0Direction g (u, v) DRight
+    ]
+
 -- | Check if B_{0,0} site is valid for REDUCTION.
 -- Uses a mix of structural and reduction-site criteria.
 -- The C code's has_bent_zero_reduction checks specific vertex degrees
@@ -1204,3 +1223,103 @@ isCanonicalV (Exp kind _ dir) parentNV g'
     tiedInv    = [ r | r <- inverseReds, cheapCanonOrd r g' == invCheap ]
     minInvBFS  = minimum (map (`redBFS` g') tiedInv)
     minAllBFS  = minimum (map (`redBFS` g') (tiedInv ++ tiedNonInv))
+
+---------------------------------------------------------------------
+-- Integrated canonical test + automorphism group
+---------------------------------------------------------------------
+
+-- | Combined canonical test and automorphism group computation.
+--
+-- Instead of running isCanonicalV then separately canonicalBFSAndGroup
+-- (which enumerates all ~120 starting edges from scratch), this function
+-- extracts automorphisms from the same cascade survivors. This matches
+-- the C code's integrated pipeline:
+--
+--   * ~94% of cases: single inverse at minimum (x0..x3) → trivial group,
+--     no BFS needed at all.
+--   * ~3% of cases: multiple inverse reductions tied at (x0..x3) →
+--     BFS among just those (typically 2-4) to find automorphisms.
+--   * ~3% of cases: non-inverse reductions also tie → BFS among all
+--     tied (typically 2-8) for both verdict and automorphisms.
+--
+-- Correctness: automorphisms preserve valid reductions and their canonical
+-- ordering. So the full group G acts on R_min (the minimum-ordering
+-- reductions). Every σ ∈ G maps some r ∈ R_min to σ(r) ∈ R_min with
+-- identical BFS code. The numbering bijection between r and σ(r) IS σ.
+-- If σ fixes every r ∈ R_min, BFS from any r uniquely numbers all
+-- vertices, forcing σ = identity. So all automorphisms are detected.
+isCanonicalWithGroup :: Expansion -> Int -> DualGraph
+                     -> (CanonVerdict, [Automorphism])
+isCanonicalWithGroup (Exp kind _ dir) parentNV g'
+    -- Early exit: longer inverse but L0 exists → can never be canonical
+    | reductionLength kind > 1 && hasAnyL0Reduction g' = (RejectL0Early, [])
+    -- No inverse reduction in the child → reject
+    | null inverseReds = (RejectNoInverse, [])
+    -- Phase 1: any reduction strictly better than inverse at (x0,x1,x2,x3)?
+    | any (\r -> cheapCanonOrd r g' < invCheap) allReds = (RejectPhase1, [])
+    -- Unique minimum at (x0..x3), single inverse → trivial group
+    | null tiedNonInv, [_] <- tiedInv = (CanonAccept, [identityAut nv])
+    -- Unique minimum at (x0..x3), multiple inverses → BFS among them
+    | null tiedNonInv = (CanonAccept, autsFromBFS g' tiedInv)
+    -- Phase 2: BFS tiebreaker with automorphism extraction
+    | otherwise = bfsCanonTestAndAuts g' tiedInv tiedNonInv
+  where
+    nv = numVertices g'
+    allReds = allReductionsUpTo (reductionLength kind) g'
+    numNew = numNewVertices kind
+    newV1 = parentNV
+    newV2 = parentNV + numNew - 1
+    isInverseRed (Red k (a, b) d) =
+        k == kind && a >= newV1 && a <= newV2
+                  && b >= newV1 && b <= newV2 && d == dir
+    inverseReds = filter isInverseRed allReds
+    invCheap = minimum (map (`cheapCanonOrd` g') inverseReds)
+    tiedNonInv = [ r | r <- allReds, not (isInverseRed r)
+                     , cheapCanonOrd r g' == invCheap ]
+    tiedInv    = [ r | r <- inverseReds, cheapCanonOrd r g' == invCheap ]
+
+-- | Identity automorphism.
+identityAut :: Int -> Automorphism
+identityAut n = Aut (array (0, n - 1) [(i, i) | i <- [0 .. n - 1]]) Preserving
+
+-- | Automorphisms from BFS comparison of reductions tied at (x0..x3).
+-- Computes BFS for each, finds the minimum code, and extracts automorphisms
+-- from all reductions achieving the minimum.
+autsFromBFS :: DualGraph -> [Reduction] -> [Automorphism]
+autsFromBFS g reds =
+    let nv = numVertices g
+        results = [(bfsWithNumbering g u v d, d) | Red _ (u, v) d <- reds]
+        minCode = minimum (map (fst . fst) results)
+        matches = [(nm, d) | ((code, nm), d) <- results, code == minCode]
+    in buildAuts nv matches
+
+-- | Phase 2: BFS tiebreaker + automorphism extraction.
+-- Accept iff some inverse reduction achieves the minimum BFS among all tied.
+bfsCanonTestAndAuts :: DualGraph -> [Reduction] -> [Reduction]
+                    -> (CanonVerdict, [Automorphism])
+bfsCanonTestAndAuts g tiedInv tiedNonInv =
+    let nv = numVertices g
+        nInv = length tiedInv
+        allReds = tiedInv ++ tiedNonInv
+        results = [(bfsWithNumbering g u v d, d) | Red _ (u, v) d <- allReds]
+        minCode = minimum (map (fst . fst) results)
+        -- Check if any inverse reduction achieves the minimum
+        invMatches = [(nm, d) | ((code, nm), d) <- take nInv results, code == minCode]
+    in if null invMatches
+       then (RejectPhase2, [])
+       else let matches = [(nm, d) | ((code, nm), d) <- results, code == minCode]
+            in (CanonAccept, buildAuts nv matches)
+
+-- | Build automorphisms from BFS numberings that all share the minimum code.
+-- The reference numbering is the first match; each other match defines an
+-- automorphism by composing its numbering with the inverse of the reference.
+buildAuts :: Int -> [(UArray Int Int, Dir)] -> [Automorphism]
+buildAuts nv matches =
+    let (refNm, refDir) = head matches
+        -- Invert: BFS number → vertex
+        refInv = array (1, nv) [(refNm ! v, v) | v <- [0..nv-1]]
+                 :: UArray Int Int
+    in [ Aut (array (0, nv-1) [(v, refInv ! (nm ! v)) | v <- [0..nv-1]])
+             (if d == refDir then Preserving else Reversing)
+       | (nm, d) <- matches
+       ]

@@ -2,7 +2,142 @@
 
 ## Status: C60 generation CORRECT — Parallel evaluation WORKING — Search module is sole API
 
-## Latest: EdgeList removed from DualGraph (2026-02-18)
+## Latest: Integrated BFS pipeline + benchmarks (2026-02-21)
+
+### Integrated `isCanonicalWithGroup` — canonical test + automorphism group in one pass
+
+The old Haskell code did two separate passes for each accepted child:
+1. `isCanonicalV` (Rule 1): x0–x3 cascade + BFS tiebreaker. Throws away all info.
+2. `canonicalBFSAndGroup` (for Rule 2): re-enumerates ALL ~120 starting edges,
+   re-runs BFS from scratch to find automorphisms.
+
+Now replaced with a single `isCanonicalWithGroup` that matches the C code's
+integrated approach:
+- **Reject cases**: Return `(RejectXxx, [])`. No automorphisms needed.
+- **Accept, unique minimum at x0–x3** (~94%): Single inverse at minimum →
+  trivial group `[identityAut]`, zero BFS.
+- **Accept, multiple inverses tied** (~3%): BFS on just those 2-4 reductions.
+- **Accept, non-inverse ties** (~3%): BFS on all tied for verdict + automorphisms.
+
+### Why this gives the full group
+Automorphisms preserve reductions and their canonical ordering. BFS from a fixed
+starting edge uniquely numbers all vertices, so any σ fixing all r ∈ R_min is
+identity. All automorphisms are detected from cascade survivors.
+
+### Benchmark: integrated pipeline + L0 lookahead (clean -O2, -N10, M2 Ultra)
+
+**C70 (30,579 isomers)**
+```
+Backend                      Baseline   Optimized   Speedup
+Sequential DFS                 12.3s       8.6s       30%
+Sequential BFS                 12.2s       8.4s       31%
+Parallel Pure (d=9)             1.8s       1.2s       33%
+Parallel MutGraph (d=9)         1.9s       1.2s       37%
+Work-queue Pure (10w, d=9)      2.7s       2.0s       26%
+Work-queue MutGraph (10w, d=9)  2.6s       1.9s       27%
+Hierarchical MutGraph (d1=4)    1.3s       950ms      27%
+BFS+DFS MutGraph (d=7)          1.4s       1.1s       21%
+```
+
+**C80 (131,200 isomers)**
+```
+Backend                      Baseline   Optimized   Speedup
+Sequential DFS                 52.4s      39.5s       25%
+Sequential BFS                 52.4s      37.7s       28%
+Parallel Pure (d=9)             6.3s       4.3s       32%
+Parallel MutGraph (d=9)         5.1s       3.9s       24%
+Work-queue Pure (10w, d=9)      7.5s       5.3s       29%
+Work-queue MutGraph (10w, d=9)  6.4s       5.1s       20%
+Hierarchical MutGraph (d1=4)    5.1s       3.9s       24%
+BFS+DFS MutGraph (d=7)          6.3s       5.2s       17%
+```
+
+Consistent 20-37% improvement across all backends and sizes. At C80 with 10
+cores, HierMut and ParMut both hit 3.9s (13.4x parallel speedup over sequential).
+
+### New functions in Canonical.hs
+- `isCanonicalWithGroup :: Expansion -> Int -> DualGraph -> (CanonVerdict, [Automorphism])`
+- `identityAut :: Int -> Automorphism`
+- `autsFromBFS :: DualGraph -> [Reduction] -> [Automorphism]`
+- `bfsCanonTestAndAuts :: DualGraph -> [Reduction] -> [Reduction] -> (CanonVerdict, [Automorphism])`
+- `buildAuts :: Int -> [(UArray Int Int, Dir)] -> [Automorphism]`
+
+### Files changed
+- `src/Canonical.hs`: Added integrated pipeline (5 new functions), `l0SurvivalSites`
+- `src/Expansion.hs`: Added `expansionFootprint`, `lengthDominanceSkip`
+- `src/Search.hs`: Switched from `isCanonicalV` + `canonicalBFSAndGroup` to
+  `isCanonicalWithGroup`. Added L0 lookahead guard. All 3 mutable backends updated.
+
+### Next: Spiral canonical form (deferred)
+Full design in `doc/SPIRAL-CANONICAL-DESIGN.md`. Replace BFS with spiral as x4
+tiebreaker. Deferred until BFS-based improvements are benchmarked in isolation.
+
+## Previous: Length Dominance Lookahead optimization (2026-02-18)
+
+### Length Dominance Lookahead
+- **New optimization**: Before applying an expansion to a parent graph, check whether
+  an existing L0 reduction in the parent will survive into the child unchanged. If so,
+  and the expansion's inverse has `reductionLength > 1`, the child will have an L0
+  reduction that lexicographically dominates the inverse — so the expansion can be
+  skipped without apply/test/undo (~160 array ops saved per skip).
+- **Detection rate**: 99.96% at C70 (440,316 / 440,513), 99.83% at C60 (75,784 / 75,910).
+  Residual cases (L0 created by expansion or surviving despite footprint overlap) fall
+  through to existing `isCanonicalV` Guard 1.
+
+### New functions
+- **`Canonical.l0SurvivalSites`**: Enumerates valid L0 edges as (u, v) pairs with u < v.
+  Computed once per parent graph (~240 array accesses).
+- **`Expansion.expansionFootprint`**: Computes IntSet of vertices modified by an expansion
+  (mainPath ++ parallelPath) without applying it.
+- **`Expansion.lengthDominanceSkip`**: Top-level predicate combining the above. Returns True
+  if any parent L0 site has both vertices outside the expansion footprint.
+
+### Files changed
+- **`src/Canonical.hs`**: Added `l0SurvivalSites` (new export)
+- **`src/Expansion.hs`**: Added `expansionFootprint`, `lengthDominanceSkip` (new exports)
+- **`src/Search.hs`**: Inserted lookahead at 3 sites: `generateChildren`, `mutDFS`,
+  `mutSplitFoldSubtree`. Updated imports.
+- **`src/TestCanonical.hs`**: Added `ssLookaheadSkip` counter to `SizeStats`, inserted
+  skip guard in `expandChildrenST`, display in stats output.
+
+### Results
+- **All tests pass**: 40/40 at C60, all 6 demo cross-checks, all 8 benchmark backends match.
+- **50 lines of code** (excluding comments/blanks), zero new dependencies.
+
+### Instrumentation
+```
+         C60 (5,770 isomers)     C70 (30,579 isomers)     C80 (131,200 isomers)
+R2 exps:      180,958                  936,849                  3,768,961
+Lookahead:     75,784 (42%)            440,316 (47%)            1,891,402 (50%)
+isCanon:       51,849 (29%)            274,810 (29%)            1,131,994 (30%)
+Size skip:     53,328 (29%)            221,727 (24%)              745,565 (20%)
+Residual L0:      126 (0.17%)              197 (0.04%)                935 (0.05%)
+Detection:     99.83%                   99.96%                    99.95%
+```
+
+### Benchmark: before/after lookahead (C80, 42 dv, 131,200 isomers, M2 Ultra, 10 cores)
+```
+Scheme                        Before    After     Change
+Sequential DFS                 52.8s    46.8s     -11%
+Sequential BFS                 52.6s    43.6s     -17%
+Parallel Pure (d=9)              6.4s     5.3s     -17%
+Parallel MutGraph (d=9)          5.2s     4.8s      -8%
+Work-queue Pure (10w, d=9)       7.7s     6.1s     -21%
+Work-queue MutGraph (10w, d=9)   6.4s     5.8s      -9%
+Hierarchical MutGraph (d1=4)     5.2s     5.0s      -4%
+BFS+DFS MutGraph (d=7)           6.7s     5.8s     -13%
+```
+
+Pure backends benefit more (11-21%) because they pay the full `mkDualGraph` cost for
+every apply/undo that the lookahead now eliminates. MutGraph backends show smaller
+gains (4-13%) since their in-place mutation + `unsafeFreeze` is already cheap.
+
+### Soundness argument (see doc/LENGTH-DOMINANCE-LOOKAHEAD.md)
+If both L0 vertices are outside the footprint: (1) their degrees are unchanged,
+(2) their adjacency lists are unchanged, (3) flanking vertices either unchanged or
+improved (5→6). So the L0 remains valid in the child.
+
+## Previous: EdgeList removed from DualGraph (2026-02-18)
 
 ### EdgeList removal
 - **Removed `EdgeList` type** (`IntMap (IntMap Int)`) from `DualGraph` — it mapped
@@ -319,13 +454,11 @@ an existing degree-5 vertex created spurious L0 reduction matches.
 
 ## Performance (C60 run)
 
-### Current (with selective unsafeFreezeGraph, 2026-02-17)
+### Current (with integrated BFS pipeline + L0 lookahead, 2026-02-21)
 ```
-Time: 1.35s  |  Allocation: 7.5 GB  |  Peak mem: 75 MB  |  Zero duplicates
-Expansion sites (bounded):     380,060
-After Rule 2:                  180,958 (Rule 2 eliminated 52%)
-Canon acceptance rate:           5,767 / 180,958 (3%)
-C70: 7.06s / 41.6 GB / 30,579 isomers through C70
+C60: ~0.95s sequential  |  Zero duplicates (1812 isomers)
+C70: 8.6s sequential, 950ms parallel (HierMut -N10)  |  30,579 isomers
+C80: 39.5s sequential, 3.9s parallel (HierMut/ParMut -N10)  |  131,200 isomers
 ```
 
 ### Optimization history
@@ -344,7 +477,9 @@ C70: 7.06s / 41.6 GB / 30,579 isomers through C70
 | + STUArray BFS + interleaved comparison | 2.0s | 12.1 GB | 155x |
 | + lazy isCanonical + nbrs elimination | 1.4s | 7.5 GB | 221x |
 | + edge colour pre-filter + instrumentation | 1.45s | 7.7 GB | 214x |
-| + selective unsafeFreezeGraph | **1.35s** | **7.5 GB** | **230x** |
+| + selective unsafeFreezeGraph | 1.35s | 7.5 GB | 230x |
+| + EdgeList removal + length dominance lookahead | 1.20s | — | 258x |
+| + integrated BFS pipeline (`isCanonicalWithGroup`) | **~0.95s** | — | **~326x** |
 | C reference (buckygen.c) | 0.02s | — | ~15000x |
 
 ### Profiling-guided fixes (2026-02-17, 13.8s → 4.2s, 3.3x speedup)
